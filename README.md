@@ -50,8 +50,8 @@ Script Properties can override `GEMINI_API_KEY`, `FAMILY_CALENDAR_ID`, and `NOTI
 
 - **Teachers sheet**: `Teacher Email | Child | Grade` pins senders to a child.
 - **Vocabulary Quest**: designed practice + separate answer-key PDFs (no LLM).
-- **Math Masters**: level matrix + designed timed-fact practice sheets and answer keys; email multiples win, else Test/Level numbers map to the matrix.
-- Menu item **Build Math Masters worksheet now** emails a packet immediately (uses Review rows / matrix fallback).
+- **Math Masters**: level matrix + designed timed-fact practice sheets and answer keys; email multiples win, else Test/Level numbers map to the matrix. Sunday briefing falls back to matrix Level 1 when needed so both PDFs still attach.
+- Menu items **Build Math Masters worksheet now** and **Build Vocabulary Quest worksheet now** email packets immediately (Review rows / matrix fallback).
 
 ## Notes
 

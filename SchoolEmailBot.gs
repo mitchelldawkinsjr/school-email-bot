@@ -16,7 +16,8 @@
  *
  * Advanced (Config flags + Teachers sheet): pin teachers to children, optional
  * Vocabulary Quest PDFs, optional Math Masters practice PDFs (level matrix +
- * designed worksheets). Packets use DocumentApp/DriveApp only.
+ * designed worksheets). Menu items can email packets immediately. Packets use
+ * DocumentApp/DriveApp only.
  */
 
 const SB = Object.freeze({
@@ -98,6 +99,7 @@ const CONFIG_DEFAULTS = [
 ];
 
 var CONFIG_CACHE_ = null;
+
 
 function showConfigSheet() {
   ensureConfigSheet_(SpreadsheetApp.getActiveSpreadsheet());
@@ -261,6 +263,7 @@ function onOpen() {
     .addItem('7. Install Sunday briefing schedule', 'installWeeklyBriefingTrigger')
     .addItem('8. Age undated Needs date rows', 'ageUndatedReviewRows')
     .addItem('9. Build Math Masters worksheet now', 'buildMathMastersWorksheetNow')
+    .addItem('10. Build Vocabulary Quest worksheet now', 'buildVocabWorksheetNow')
     .addSeparator()
     .addSubMenu(ui.createMenu('Advanced')
       .addItem('Open Config sheet', 'showConfigSheet')
@@ -616,8 +619,14 @@ function sendWeeklyBriefing_(force) {
     GmailApp.sendEmail(recipients.join(','), digest.subject, digest.plain, options);
     props.setProperty('LAST_BRIEFING_WEEK', digest.weekKey);
     console.log('Weekly briefing sent for ' + digest.weekKey +
-      (attachments.length ? ' with ' + attachments.length + ' vocab packet(s).' : '.'));
-    SpreadsheetApp.getActive().toast('Weekly briefing sent.');
+      (attachments.length
+        ? ' with ' + attachments.length + ' attachment(s) (vocab and/or Math Masters practice + answer keys).'
+        : '.'));
+    SpreadsheetApp.getActive().toast(
+      attachments.length
+        ? 'Weekly briefing sent with ' + attachments.length + ' worksheet file(s).'
+        : 'Weekly briefing sent.'
+    );
   } finally {
     lock.releaseLock();
   }
@@ -937,7 +946,7 @@ function renderBriefing_(model) {
     'style="width:100%;border-collapse:collapse;background-color:#f1f3ed"><tbody><tr>' +
     '<td align="center" style="padding:28px 12px 36px">');
   html.push('<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" ' +
-    'style="width:100%;max-width:620px;margin:0 auto;border:1px solid #e7e9e1;' +
+    'style="width:100%;max-width:1080px;margin:0 auto;border:1px solid #e7e9e1;' +
     'border-collapse:separate;border-spacing:0;border-radius:8px;overflow:hidden;' +
     'background-color:#fffefa"><tbody>');
 
@@ -949,34 +958,34 @@ function renderBriefing_(model) {
     '<table role="presentation" width="38" height="38" cellspacing="0" cellpadding="0" border="0" ' +
     'style="width:38px;height:38px;border:1px solid #9eb5a4;border-collapse:separate;border-radius:50%">' +
     '<tbody><tr><td align="center" valign="middle" style="color:#f5f3e9;' +
-    "font-family:Georgia,'Times New Roman',serif;font-size:14px;line-height:18px;letter-spacing:1px\">" +
+    "font-family:Georgia,'Times New Roman',serif;font-size:16px;line-height:20px;letter-spacing:1px\">" +
     escapeHtml_(brand.schoolInitials) + '</td>' +
     '</tr></tbody></table></td>' +
     '<td valign="middle" style="padding-left:10px">' +
-    '<div style="color:#f7f5eb;font-size:14px;line-height:19px;font-weight:600">' +
+    '<div style="color:#f7f5eb;font-size:17px;line-height:22px;font-weight:600">' +
     escapeHtml_(brand.schoolName) + '</div>' +
-    '<div style="color:#cad8cc;font-size:10px;line-height:15px;letter-spacing:1.2px;' +
+    '<div style="color:#cad8cc;font-size:13px;line-height:18px;letter-spacing:1.2px;' +
     'text-transform:uppercase">' + escapeHtml_(brand.familyName) + '</div></td>' +
-    '<td align="right" valign="middle" style="color:#dce5dc;font-size:9px;line-height:14px;' +
+    '<td align="right" valign="middle" style="color:#dce5dc;font-size:12px;line-height:17px;' +
     'letter-spacing:1px;text-transform:uppercase">Family weekly note</td>' +
     '</tr></tbody></table></td></tr>');
 
   // Greeting
   html.push('<tr><td style="padding:28px 32px 24px">' +
-    '<div style="color:#b87937;font-size:10px;line-height:14px;font-weight:700;' +
+    '<div style="color:#b87937;font-size:13px;line-height:18px;font-weight:700;' +
     'letter-spacing:1.4px;text-transform:uppercase">A clear note for the week</div>' +
     '<h1 style="margin:9px 0 7px;color:#26352d;font-family:Georgia,\'Times New Roman\',serif;' +
-    'font-size:28px;line-height:35px;font-weight:400">Hello, ' +
+    'font-size:32px;line-height:40px;font-weight:400">Hello, ' +
     escapeHtml_(brand.familyName) + '.</h1>' +
-    '<p style="margin:0;color:#65756c;font-size:13px;line-height:20px">' +
+    '<p style="margin:0;color:#65756c;font-size:16px;line-height:24px">' +
     'Here\'s what matters for ' + escapeHtml_(brand.childrenLabel || 'your kids') +
     ' this week.</p>' +
     '<table role="presentation" cellspacing="0" cellpadding="0" border="0" style="margin-top:17px;' +
     'border-collapse:collapse"><tbody><tr>' +
-    '<td style="padding:7px 10px;background-color:#edf3ed;color:#355747;font-size:10px;' +
-    'line-height:14px;font-weight:700;letter-spacing:.25px">WEEK OF ' +
+    '<td style="padding:8px 12px;background-color:#edf3ed;color:#355747;font-size:13px;' +
+    'line-height:18px;font-weight:700;letter-spacing:.25px">WEEK OF ' +
     escapeHtml_(String(model.dateLabel || '').toUpperCase()) + '</td>' +
-    '<td style="padding-left:11px;color:#65756c;font-size:10px;line-height:14px">' +
+    '<td style="padding-left:11px;color:#65756c;font-size:13px;line-height:18px">' +
     escapeHtml_(brand.schoolName) + '</td></tr></tbody></table></td></tr>');
 
   // Short version
@@ -984,11 +993,11 @@ function renderBriefing_(model) {
     '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" ' +
     'style="width:100%;border-collapse:collapse;background-color:#f4f6f1;border-left:3px solid #355747">' +
     '<tbody><tr><td style="padding:15px 17px 16px">' +
-    '<div style="color:#355747;font-size:10px;line-height:14px;font-weight:700;' +
+    '<div style="color:#355747;font-size:13px;line-height:18px;font-weight:700;' +
     'letter-spacing:1.1px;text-transform:uppercase">The short version</div>' +
     '<p style="margin:7px 0 0;color:#26352d;font-family:Georgia,\'Times New Roman\',serif;' +
-    'font-size:16px;line-height:24px">' + escapeHtml_(summary) + '</p>' +
-    '<p style="margin:10px 0 0;color:#65756c;font-size:10px;line-height:15px">' +
+    'font-size:19px;line-height:28px">' + escapeHtml_(summary) + '</p>' +
+    '<p style="margin:10px 0 0;color:#65756c;font-size:13px;line-height:19px">' +
     'Summary of school messages for this week. Each item below keeps full instructions and a link to the source email.</p>' +
     '</td></tr></tbody></table></td></tr>');
 
@@ -1000,23 +1009,23 @@ function renderBriefing_(model) {
       '<tbody><tr><td style="padding:14px 16px 15px;border-left:3px solid #b87937">' +
       '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" ' +
       'style="width:100%;border-collapse:collapse"><tbody><tr>' +
-      '<td style="color:#9a642c;font-size:10px;line-height:14px;font-weight:700;' +
+      '<td style="color:#9a642c;font-size:13px;line-height:18px;font-weight:700;' +
       'letter-spacing:1.1px;text-transform:uppercase">' + escapeHtml_(reminder.eyebrow) + '</td>' +
-      '<td align="right" style="color:#8b663b;font-size:9px;line-height:14px;font-weight:700;' +
+      '<td align="right" style="color:#8b663b;font-size:12px;line-height:17px;font-weight:700;' +
       'text-transform:uppercase">' + escapeHtml_(reminder.shortDeadline) + '</td></tr>' +
       '<tr><td colspan="2"><h2 style="margin:7px 0 6px;color:#26352d;' +
-      "font-family:Georgia,'Times New Roman',serif;font-size:17px;line-height:22px;font-weight:400\">" +
+      "font-family:Georgia,'Times New Roman',serif;font-size:20px;line-height:26px;font-weight:400\">" +
       escapeHtml_(reminder.title) + '</h2></td></tr>' +
-      '<tr><td colspan="2"><p style="margin:0 0 9px;color:#536257;font-size:12px;line-height:19px">' +
+      '<tr><td colspan="2"><p style="margin:0 0 9px;color:#536257;font-size:15px;line-height:23px">' +
       emailHtmlText_(reminder.detail) + '</p></td></tr>');
     if (reminder.deadline) {
       html.push('<tr><td colspan="2" style="padding:8px 10px;background-color:#f8ead6;color:#79582f;' +
-        'font-size:11px;line-height:16px;font-weight:700">' +
+        'font-size:14px;line-height:20px;font-weight:700">' +
         escapeHtml_(reminder.deadline) + '</td></tr>');
     }
     if (reminder.action) {
-      html.push('<tr><td colspan="2" style="padding-top:8px;color:#765a3a;font-size:11px;' +
-        'line-height:16px">' + emailHtmlText_(reminder.action) + '</td></tr>');
+      html.push('<tr><td colspan="2" style="padding-top:8px;color:#765a3a;font-size:14px;' +
+        'line-height:20px">' + emailHtmlText_(reminder.action) + '</td></tr>');
     }
     if (reminder.link) {
       html.push('<tr><td colspan="2" style="padding-top:8px">' +
@@ -1027,22 +1036,22 @@ function renderBriefing_(model) {
 
   // Around school updates
   html.push('<tr><td style="padding:0 32px 10px"><h2 style="margin:0;color:#26352d;' +
-    "font-family:Georgia,'Times New Roman',serif;font-size:20px;line-height:26px;font-weight:400\">" +
+    "font-family:Georgia,'Times New Roman',serif;font-size:24px;line-height:30px;font-weight:400\">" +
     'Around ' + escapeHtml_(brand.schoolShortName) + '</h2></td></tr>');
   if (!updates.length) {
-    html.push('<tr><td style="padding:12px 32px 24px;color:#65756c;font-size:11px;line-height:17px">' +
+    html.push('<tr><td style="padding:12px 32px 24px;color:#65756c;font-size:14px;line-height:21px">' +
       'Nothing else needs attention beyond the calendar this week.</td></tr>');
   } else {
     updates.forEach(function (update, index) {
       const last = index === updates.length - 1;
       html.push('<tr><td style="padding:' + (last ? '12px 32px 24px' : '12px 32px') + ';' +
         (last ? '' : 'border-bottom:1px solid #e7e9e1;') + '">' +
-        '<div style="color:#65756c;font-size:9px;line-height:13px;font-weight:700;' +
+        '<div style="color:#65756c;font-size:12px;line-height:16px;font-weight:700;' +
         'letter-spacing:1.1px;text-transform:uppercase">' + escapeHtml_(update.label) + '</div>' +
-        '<h3 style="margin:4px 0;color:#26352d;font-size:13px;line-height:18px;font-weight:700">' +
+        '<h3 style="margin:4px 0;color:#26352d;font-size:16px;line-height:22px;font-weight:700">' +
         escapeHtml_(update.title) + '</h3>' +
         (update.detail
-          ? '<p style="margin:0;color:#65756c;font-size:11px;line-height:17px">' +
+          ? '<p style="margin:0;color:#65756c;font-size:14px;line-height:21px">' +
             emailHtmlText_(update.detail) + '</p>'
           : '') +
         (update.link
@@ -1056,14 +1065,14 @@ function renderBriefing_(model) {
   if (exceptions.length) {
     html.push('<tr><td style="padding:18px 32px 22px;border-top:1px solid #e7e9e1;background-color:#fffefa">' +
       '<h2 style="margin:0 0 8px;color:#26352d;font-family:Georgia,\'Times New Roman\',serif;' +
-      'font-size:18px;line-height:24px;font-weight:400">On the Review sheet</h2>' +
-      '<p style="margin:0 0 12px;color:#65756c;font-size:10px;line-height:15px">' +
+      'font-size:22px;line-height:28px;font-weight:400">On the Review sheet</h2>' +
+      '<p style="margin:0 0 12px;color:#65756c;font-size:13px;line-height:19px">' +
       'Dated items auto-publish. These rows still need a quick human look.</p>');
     exceptions.forEach(function (item, index) {
       const when = item.date ? prettyDate_(item.date) : 'No date';
       const last = index === exceptions.length - 1;
-      html.push('<p style="margin:0 0 ' + (last ? '0' : '8') + 'px;color:#26352d;font-size:12px;' +
-        'line-height:18px"><strong>' + escapeHtml_(when) + '</strong> · ' +
+      html.push('<p style="margin:0 0 ' + (last ? '0' : '8') + 'px;color:#26352d;font-size:15px;' +
+        'line-height:22px"><strong>' + escapeHtml_(when) + '</strong> · ' +
         escapeHtml_(item.child) + ' — ' + escapeHtml_(item.title) +
         ' <span style="color:#65756c">(' + escapeHtml_(item.status) + ')</span>' +
         (item.link ? ' · ' + openEmailHtml_(item.link) : '') + '</p>');
@@ -1074,9 +1083,9 @@ function renderBriefing_(model) {
   // Calendar — already published / approved for this week.
   html.push('<tr><td style="padding:21px 32px 22px;border-top:1px solid #e7e9e1;background-color:#f7f8f4">' +
     '<h2 style="margin:0 0 11px;color:#26352d;font-family:Georgia,\'Times New Roman\',serif;' +
-    'font-size:20px;line-height:26px;font-weight:400">Added these on the calendar</h2>');
+    'font-size:24px;line-height:30px;font-weight:400">Added these on the calendar</h2>');
   if (!calendarRows.length) {
-    html.push('<p style="margin:0;color:#65756c;font-size:11px;line-height:17px">' +
+    html.push('<p style="margin:0;color:#65756c;font-size:14px;line-height:21px">' +
       'Nothing on the family calendar for this week.</p>');
   } else {
     html.push('<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" ' +
@@ -1084,14 +1093,14 @@ function renderBriefing_(model) {
     calendarRows.forEach(function (row, index) {
       const last = index === calendarRows.length - 1;
       const border = last ? 'none' : '1px solid #dce6dc';
-      html.push('<tr><td width="70" valign="top" style="width:70px;padding:8px 0;color:#355747;' +
-        'font-size:9px;line-height:15px;font-weight:700;letter-spacing:.5px;border-bottom:' +
+      html.push('<tr><td width="78" valign="top" style="width:78px;padding:8px 0;color:#355747;' +
+        'font-size:12px;line-height:18px;font-weight:700;letter-spacing:.5px;border-bottom:' +
         border + '">' + escapeHtml_(row.date) + '</td>' +
         '<td valign="top" style="padding:7px 0 8px;border-bottom:' + border + '">' +
-        '<div style="color:#26352d;font-size:11px;line-height:15px;font-weight:700">' +
+        '<div style="color:#26352d;font-size:14px;line-height:19px;font-weight:700">' +
         escapeHtml_(row.title) + '</div>' +
         (row.detail
-          ? '<div style="padding-top:4px;color:#65756c;font-size:11px;line-height:16px">' +
+          ? '<div style="padding-top:4px;color:#65756c;font-size:14px;line-height:20px">' +
             emailHtmlText_(row.detail) + '</div>'
           : '') +
         (row.link
@@ -1107,16 +1116,16 @@ function renderBriefing_(model) {
   if (model.vocabLists.length) {
     html.push('<tr><td style="padding:18px 32px 22px;border-top:1px solid #e7e9e1;background-color:#fffefa">' +
       '<h2 style="margin:0 0 10px;color:#26352d;font-family:Georgia,\'Times New Roman\',serif;' +
-      'font-size:18px;line-height:24px;font-weight:400">Spelling and vocabulary</h2>');
+      'font-size:22px;line-height:28px;font-weight:400">Spelling and vocabulary</h2>');
     model.vocabLists.forEach(function (list) {
-      html.push('<p style="margin:0 0 8px;color:#26352d;font-size:12px;line-height:18px"><strong>' +
+      html.push('<p style="margin:0 0 8px;color:#26352d;font-size:15px;line-height:22px"><strong>' +
         escapeHtml_(list.child) + '</strong> — ' + escapeHtml_(list.words.join(', ')) + '</p>');
       if (list.notes.length) {
-        html.push('<p style="margin:0 0 8px;color:#65756c;font-size:11px;line-height:16px">' +
+        html.push('<p style="margin:0 0 8px;color:#65756c;font-size:14px;line-height:20px">' +
           escapeHtml_(list.notes.join(' ')) + '</p>');
       }
     });
-    html.push('<p style="margin:0;color:#65756c;font-size:10px;line-height:15px">' +
+    html.push('<p style="margin:0;color:#65756c;font-size:13px;line-height:19px">' +
       'Vocabulary Quest child worksheets plus a separate parent answer-key file attach when this briefing is sent.</p></td></tr>');
   }
 
@@ -1124,13 +1133,13 @@ function renderBriefing_(model) {
   if (model.mathMasters && model.mathMasters.length) {
     html.push('<tr><td style="padding:18px 32px 22px;border-top:1px solid #e7e9e1;background-color:#fffefa">' +
       '<h2 style="margin:0 0 10px;color:#26352d;font-family:Georgia,\'Times New Roman\',serif;' +
-      'font-size:18px;line-height:24px;font-weight:400">Math Masters practice</h2>');
+      'font-size:22px;line-height:28px;font-weight:400">Math Masters practice</h2>');
     model.mathMasters.forEach(function (mission) {
-      html.push('<p style="margin:0 0 8px;color:#26352d;font-size:12px;line-height:18px"><strong>' +
+      html.push('<p style="margin:0 0 8px;color:#26352d;font-size:15px;line-height:22px"><strong>' +
         escapeHtml_(mission.child) + '</strong> — ' + escapeHtml_(mission.label) +
         ' (' + escapeHtml_(mission.factsLabel) + ')</p>');
     });
-    html.push('<p style="margin:0;color:#65756c;font-size:10px;line-height:15px">' +
+    html.push('<p style="margin:0;color:#65756c;font-size:13px;line-height:19px">' +
       SB.mathMastersSheetsPerWeek +
       ' randomized child practice sheets plus a separate parent answer-key file attach when this briefing is sent. ' +
       'No word problems.</p></td></tr>');
@@ -1141,34 +1150,34 @@ function renderBriefing_(model) {
     '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" ' +
     'style="width:100%;border-collapse:collapse"><tbody><tr><td valign="top">' +
     '<h2 style="margin:0;color:#26352d;font-family:Georgia,\'Times New Roman\',serif;' +
-    'font-size:18px;line-height:24px;font-weight:400">From the school inbox</h2>' +
-    '<p style="margin:4px 0 0;color:#65756c;font-size:10px;line-height:15px">' +
+    'font-size:22px;line-height:28px;font-weight:400">From the school inbox</h2>' +
+    '<p style="margin:4px 0 0;color:#65756c;font-size:13px;line-height:19px">' +
     'Use Open email on any item to jump straight to the teacher thread.</p></td>');
   if (model.sheetUrl) {
     html.push('<td align="right" valign="top"><a href="' + escapeHtml_(model.sheetUrl) +
-      '" style="display:inline-block;padding:7px 9px;border:1px solid #dce6dc;border-radius:3px;' +
-      'color:#355747;font-size:10px;line-height:14px;font-weight:700;text-decoration:none;' +
+      '" style="display:inline-block;padding:8px 11px;border:1px solid #dce6dc;border-radius:3px;' +
+      'color:#355747;font-size:13px;line-height:18px;font-weight:700;text-decoration:none;' +
       'white-space:nowrap">Open Review sheet</a></td>');
   }
   html.push('</tr></tbody></table>' +
     '<p style="margin:12px 0 0;padding-top:11px;border-top:1px solid #e7e9e1;color:#65756c;' +
-    'font-size:10px;line-height:16px">This briefing was generated to make school updates easier to scan. ' +
+    'font-size:13px;line-height:19px">This briefing was generated to make school updates easier to scan. ' +
     'It may miss context; please check the original school messages for full details, instructions, and changes.</p>' +
     '</td></tr>');
 
   // Footer
   html.push('<tr><td style="padding:14px 32px 16px;background-color:#355747;color:#e1e8df;' +
-    'font-size:10px;line-height:15px">' +
+    'font-size:13px;line-height:19px">' +
     '<table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" ' +
     'style="width:100%;border-collapse:collapse"><tbody><tr>' +
     '<td style="color:#e1e8df">With care,<br><strong style="color:#ffffff">School Email Bot</strong></td>' +
-    '<td align="right" style="color:#c6d3c7;font-size:9px;line-height:14px;letter-spacing:.4px;' +
+    '<td align="right" style="color:#c6d3c7;font-size:12px;line-height:17px;letter-spacing:.4px;' +
     'text-transform:uppercase">' + escapeHtml_(model.dateLabel) + '</td>' +
     '</tr></tbody></table></td></tr>');
 
   html.push('</tbody></table>');
-  html.push('<p style="max-width:560px;margin:12px auto 0;color:#7a877d;font-size:9px;' +
-    'line-height:14px;text-align:center">A weekly summary for ' +
+  html.push('<p style="max-width:1080px;margin:12px auto 0;color:#7a877d;font-size:12px;' +
+    'line-height:17px;text-align:center">A weekly summary for ' +
     escapeHtml_(brand.familyName) + ' · Prepared from ' +
     escapeHtml_(brand.schoolName) + ' messages</p>');
   html.push('</td></tr></tbody></table></div>');
@@ -1388,26 +1397,89 @@ function openEmailHtml_(url) {
   const href = String(url || '').trim();
   if (!/^https:\/\/mail\.google\.com\//i.test(href)) return '';
   return '<a href="' + escapeHtml_(href) +
-    '" style="color:#355747;font-size:10px;line-height:14px;font-weight:700;' +
+    '" style="color:#355747;font-size:13px;line-height:18px;font-weight:700;' +
     'text-decoration:underline">Open email</a>';
 }
 
 /**
  * Advanced: Vocabulary Quest packet candidates for the week.
- * A list counts when a Review row due this week names vocabulary or
- * spelling and the instructions include the teacher's word list.
  */
 function vocabListsForWeek_(rows, weekStart, weekEnd, family) {
-  family = family || cfg_();
+  return resolveVocabLists_(rows, weekStart, weekEnd, {forMenu: false, family: family});
+}
+
+/** Menu: build Vocabulary Quest practice + answer key and email parents. */
+function buildVocabWorksheetNow() {
+  const family = cfg_();
+  const book = SpreadsheetApp.getActiveSpreadsheet();
+  const review = requireSheet_(book, SB.reviewSheet);
+  const window = schoolWeek_(new Date());
+  const weekStart = localDateKey_(window.start);
+  const weekEnd = localDateKey_(window.end);
+  const weekKey = weekStart;
+  const lists = resolveVocabLists_(
+    readReviewRows_(review), weekStart, weekEnd, {forMenu: true, family: family}
+  );
+  if (!lists.length) {
+    SpreadsheetApp.getActive().toast(
+      'No vocabulary / spelling word list found on Review (need 3+ words).'
+    );
+    return;
+  }
+  const digest = {weekKey: weekKey, vocabLists: lists, plain: '', html: ''};
+  const attachments = buildVocabAttachments_(digest);
+  if (!attachments.length) {
+    SpreadsheetApp.getActive().toast('Vocabulary Quest PDF failed. Check Executions log.');
+    return;
+  }
+  const recipients = briefingRecipients_();
+  GmailApp.sendEmail(
+    recipients.join(','),
+    'Vocabulary Quest — ' + weekKey,
+    lists.map(function (list) {
+      return list.child + ' — ' + list.title + ' (' + list.words.length + ' words): ' +
+        list.words.join(', ');
+    }).join('\n\n') +
+      '\n\nChild practice worksheets + a separate parent answer-key file are attached.',
+    {attachments: attachments, name: 'School Email Bot'}
+  );
+  SpreadsheetApp.getActive().toast(
+    'Vocabulary Quest emailed: ' +
+      lists.map(function (list) { return list.words.length + ' words'; }).join('; ')
+  );
+}
+
+/**
+ * 1) Due this week
+ * 2) Menu only: still-useful vocab/spelling rows with a parseable word list
+ */
+function resolveVocabLists_(rows, weekStart, weekEnd, opts) {
+  opts = opts || {};
+  const family = opts.family || cfg_();
+  let lists = collectVocabLists_(rows, family, function (row, dueKey, status) {
+    if (status === 'Skipped' || status === 'Possible duplicate' || status === 'Error') return false;
+    return dueKey && dueKey >= weekStart && dueKey <= weekEnd;
+  });
+  if (!lists.length && opts.forMenu) {
+    lists = collectVocabLists_(rows, family, function (row, dueKey, status) {
+      if (status === 'Possible duplicate' || status === 'Error') return false;
+      if (dueKey && isStillUseful_(dueKey)) return true;
+      const blob = [row[2], row[3], row[6], row[13]].join(' ');
+      return /vocab|spelling/i.test(blob) && status !== 'Skipped';
+    });
+  }
+  return lists;
+}
+
+function collectVocabLists_(rows, family, includeRow) {
   const groups = new Map();
   rows.forEach(function (row) {
     const status = String(row[0] || '').trim();
-    if (status === 'Skipped' || status === 'Possible duplicate' || status === 'Error') return;
     const child = String(row[1] || '').trim();
     if (!packetChildrenAllowed_(family.vocabChildren, family.children, child)) return;
     const due = parseLocalDate_(row[4]);
     const dueKey = due ? localDateKey_(due) : '';
-    if (!dueKey || dueKey < weekStart || dueKey > weekEnd) return;
+    if (!includeRow(row, dueKey, status)) return;
     const blob = [row[2], row[3], row[6], row[13]].join(' ');
     if (!/vocab|spelling/i.test(blob)) return;
     const parsed = parseWordList_(String(row[6] || '') + '\n' + String(row[13] || ''));
@@ -1480,7 +1552,8 @@ function buildVocabAttachments_(digest) {
 function appendBriefingLines_(digest, lines) {
   if (!lines.length) return;
   digest.plain += '\n\n' + lines.join('\n');
-  digest.html += '<div style="font-family:Arial,sans-serif;max-width:640px;color:#1f2937">' +
+  digest.html += '<div style="font-family:Arial,sans-serif;max-width:1080px;color:#1f2937;' +
+    'font-size:15px;line-height:22px">' +
     lines.map(function (line) {
       return '<p style="margin:8px 0">' + escapeHtml_(line) + '</p>';
     }).join('') + '</div>';
@@ -1488,6 +1561,7 @@ function appendBriefingLines_(digest, lines) {
 
 /** Menu: build a Math Masters packet and email it to the parents. */
 function buildMathMastersWorksheetNow() {
+  const family = cfg_();
   const book = SpreadsheetApp.getActiveSpreadsheet();
   const review = requireSheet_(book, SB.reviewSheet);
   const window = schoolWeek_(new Date());
@@ -1495,7 +1569,7 @@ function buildMathMastersWorksheetNow() {
   const weekEnd = localDateKey_(window.end);
   const weekKey = weekStart;
   const missions = resolveMathMastersMissions_(
-    readReviewRows_(review), weekStart, weekEnd, {forMenu: true}
+    readReviewRows_(review), weekStart, weekEnd, {forMenu: true, family: family}
   );
   const digest = {
     weekKey: weekKey,
@@ -1548,22 +1622,28 @@ function buildMathMastersAttachments_(digest) {
 }
 
 function mathMastersForWeek_(rows, weekStart, weekEnd, family) {
-  return resolveMathMastersMissions_(rows, weekStart, weekEnd, {forMenu: false, family: family});
+  // Sunday briefing always tries to attach practice + answer-key PDFs.
+  return resolveMathMastersMissions_(rows, weekStart, weekEnd, {
+    forBriefing: true,
+    family: family
+  });
 }
 
 /**
  * 1) Due this week from Review emails
- * 2) Menu only: still-useful / recent Math Masters rows (even Skipped)
- * 3) Menu only: challenge matrix Level 1 when nothing is on the sheet
+ * 2) Menu / briefing: still-useful / recent Math Masters rows (even Skipped)
+ * 3) Menu / briefing: challenge matrix Level 1 when nothing is on the sheet
+ *    so Sunday still gets both Math Masters docs.
  */
 function resolveMathMastersMissions_(rows, weekStart, weekEnd, opts) {
   opts = opts || {};
   const family = opts.family || cfg_();
+  const allowFallback = !!(opts.forMenu || opts.forBriefing);
   let missions = collectMathMastersMissions_(rows, family, function (row, dueKey, status) {
     if (status === 'Skipped' || status === 'Possible duplicate' || status === 'Error') return false;
     return dueKey && dueKey >= weekStart && dueKey <= weekEnd;
   });
-  if (!missions.length && opts.forMenu) {
+  if (!missions.length && allowFallback) {
     missions = collectMathMastersMissions_(rows, family, function (row, dueKey, status) {
       if (status === 'Possible duplicate' || status === 'Error') return false;
       if (dueKey && isStillUseful_(dueKey)) return true;
@@ -1573,12 +1653,14 @@ function resolveMathMastersMissions_(rows, weekStart, weekEnd, opts) {
         /\bfinal(?:\s+level)?\b|\bchampionship\b/i.test(blob);
     });
   }
-  if (!missions.length && opts.forMenu) {
+  if (!missions.length && allowFallback) {
     const fallback = missionFromLevel_(MATH_MASTERS_LEVELS[0]);
-    fallback.child = family.children[0] || 'Student';
+    fallback.child = (family.mathChildren[0] || family.children[0] || 'Student');
     fallback.title = 'Math Masters Level 1';
     fallback.due = weekStart;
-    fallback.source = 'challenge matrix Level 1 (no Review row / no email multiples)';
+    fallback.source = opts.forBriefing
+      ? 'challenge matrix Level 1 (Sunday briefing default)'
+      : 'challenge matrix Level 1 (no Review row / no email multiples)';
     missions = [fallback];
   }
   return missions;
@@ -2021,20 +2103,16 @@ function generateVocabPacket_(list, weekKey) {
   });
   const matchOrder = seededShuffle_(entries.slice(), seed + ':match');
   const matchLetters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
-  const starters = sentenceStarters_(words, seed);
   const chooseItems = chooseWordItems_(entries, seed);
-  const fillItems = fillBlankItems_(entries, seed);
-  const abcOrder = words.slice().sort(function (a, b) {
-    return a.toLowerCase().localeCompare(b.toLowerCase());
-  });
+  const spellingQuizOrder = seededShuffle_(words.slice(), seed + ':spelling-quiz');
   const child = list.child || 'Student';
   const practicePages = buildVocabQuestPracticePages_({
     child: child, entries: entries, matchOrder: matchOrder, matchLetters: matchLetters,
-    starters: starters, chooseItems: chooseItems, fillItems: fillItems, words: words
+    chooseItems: chooseItems, words: words, spellingQuizOrder: spellingQuizOrder
   });
   const answerPages = buildVocabQuestAnswerPages_({
     child: child, entries: entries, matchOrder: matchOrder, matchLetters: matchLetters,
-    chooseItems: chooseItems, fillItems: fillItems, abcOrder: abcOrder, words: words
+    chooseItems: chooseItems, words: words, spellingQuizOrder: spellingQuizOrder
   });
   const slug = normalize_(list.title).replace(/\s+/g, '-').slice(0, 40) || 'vocabulary';
   return {
@@ -2061,8 +2139,8 @@ function buildVocabQuestPracticePages_(model) {
     },
     {
       kicker: 'VOCABULARY QUEST / TUESDAY — 2 OF ' + total,
-      title: 'Match & Sentence Starters',
-      instructions: 'Write the letter of the meaning next to each word. Then finish each sentence starter.',
+      title: 'Match & Act It Out',
+      instructions: 'Write the letter of the meaning next to each word. Then pick 3 words, write them down, and act them out.',
       kind: 'match',
       pageNumber: 2,
       total: total,
@@ -2088,8 +2166,8 @@ function buildVocabQuestPracticePages_(model) {
     },
     {
       kicker: 'VOCABULARY QUEST / THURSDAY — 5 OF ' + total,
-      title: 'Remember & Celebrate',
-      instructions: 'Put the words in ABC order, fill in the blanks, then celebrate a favorite word.',
+      title: 'Final Spelling Quiz',
+      instructions: 'This is the final quiz of the week. Someone reads each word aloud. Cover the list, then spell the word on the line.',
       kind: 'thursday',
       pageNumber: 5,
       total: total,
@@ -2241,15 +2319,17 @@ function appendVocabMatchContent_(body, model) {
     );
     line.setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(2);
   });
-  const startersHead = body.appendParagraph('Sentence starters');
-  startersHead.setFontFamily('Arial').setFontSize(12).setBold(true).setForegroundColor(navy)
+  const actHead = body.appendParagraph('Act it out');
+  actHead.setFontFamily('Arial').setFontSize(12).setBold(true).setForegroundColor(navy)
     .setSpacingBefore(10).setSpacingAfter(4);
-  model.starters.forEach(function (starter) {
-    body.appendParagraph(starter).setFontFamily('Arial').setFontSize(10)
-      .setForegroundColor(ink).setSpacingAfter(1);
-    body.appendParagraph('________________________________')
-      .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(6);
-  });
+  body.appendParagraph('Pick 3 words, write them down, then act them out.')
+    .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(6);
+  for (let i = 1; i <= 3; i++) {
+    body.appendParagraph(i + '. Word: ____________________')
+      .setFontFamily('Arial').setFontSize(11).setForegroundColor(ink).setSpacingAfter(2);
+    body.appendParagraph('How I will act it out: ________________________________')
+      .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(8);
+  }
 }
 
 function appendVocabScrambleContent_(body, model) {
@@ -2296,27 +2376,22 @@ function appendVocabChooseContent_(body, model) {
 function appendVocabThursdayContent_(body, model) {
   const ink = VOCAB_QUEST_DESIGN.ink;
   const navy = VOCAB_QUEST_DESIGN.navy;
-  body.appendParagraph('ABC spelling challenge').setFontFamily('Arial').setFontSize(12)
-    .setBold(true).setForegroundColor(navy).setSpacingAfter(6);
-  appendVocabSimpleTable_(body, [['#', 'Word in ABC order']].concat(
-    model.words.map(function (_, index) {
-      return [String(index + 1), '______________'];
+  body.appendParagraph('Spelling challenge').setFontFamily('Arial').setFontSize(12)
+    .setBold(true).setForegroundColor(navy).setSpacingAfter(4);
+  body.appendParagraph(
+    'Parent / helper: read each word aloud from the answer key (Final spelling quiz order). ' +
+    'Child: listen, then spell it on the line. No peeking at Monday\'s word list.'
+  ).setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(10);
+  const count = (model.spellingQuizOrder && model.spellingQuizOrder.length)
+    ? model.spellingQuizOrder.length : model.words.length;
+  appendVocabSimpleTable_(body, [['#', 'Spell the word']].concat(
+    Array.apply(null, Array(count)).map(function (_, index) {
+      return [String(index + 1), '________________________'];
     })
   ));
-  body.appendParagraph('Fill in the blank').setFontFamily('Arial').setFontSize(12)
-    .setBold(true).setForegroundColor(navy).setSpacingBefore(10).setSpacingAfter(4);
-  model.fillItems.forEach(function (item, index) {
-    body.appendParagraph((index + 1) + '. ' + item.sentence)
-      .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(1);
-    body.appendParagraph('Word bank: ' + item.bank.join(', '))
-      .setFontFamily('Arial').setFontSize(9).setForegroundColor(ink).setSpacingAfter(1);
-    body.appendParagraph('Answer: ______________')
-      .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(6);
-  });
-  body.appendParagraph('Word champion!').setFontFamily('Arial').setFontSize(12)
-    .setBold(true).setForegroundColor(navy).setSpacingBefore(6).setSpacingAfter(4);
-  body.appendParagraph('Favorite word: ______________  Because: ____________________')
-    .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink);
+  body.appendParagraph('Score: ______ / ' + count)
+    .setFontFamily('Arial').setFontSize(11).setBold(true).setForegroundColor(navy)
+    .setSpacingBefore(14);
 }
 
 function appendVocabAnswerContent_(body, model) {
@@ -2357,15 +2432,15 @@ function appendVocabAnswerContent_(body, model) {
     body.appendParagraph((index + 1) + '. ' + item.answer)
       .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(2);
   });
-  body.appendParagraph('Thursday ABC order').setFontFamily('Arial').setFontSize(12)
+  body.appendParagraph('Thursday final spelling quiz — read aloud in this order')
+    .setFontFamily('Arial').setFontSize(12)
     .setBold(true).setForegroundColor(navy).setSpacingBefore(8).setSpacingAfter(4);
-  body.appendParagraph(model.abcOrder.join(', '))
-    .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(6);
-  body.appendParagraph('Thursday fill-in-the-blank').setFontFamily('Arial').setFontSize(12)
-    .setBold(true).setForegroundColor(navy).setSpacingAfter(4);
-  model.fillItems.forEach(function (item, index) {
-    body.appendParagraph((index + 1) + '. ' + item.answer)
-      .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(2);
+  body.appendParagraph(
+    'Say each word clearly. Wait for the child to write, then move to the next word.'
+  ).setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(6);
+  (model.spellingQuizOrder || model.words).forEach(function (word, index) {
+    body.appendParagraph((index + 1) + '. ' + word)
+      .setFontFamily('Arial').setFontSize(11).setForegroundColor(ink).setSpacingAfter(3);
   });
 }
 
