@@ -6,28 +6,75 @@
  *
  * Simple setup: fill Config, set GEMINI_API_KEY in Script Properties, install
  * triggers. Dated assignments auto-publish unless they look like a duplicate
- * or update. A Sunday briefing covers the coming school week.
+ * or update. When Gemini leaves a due date blank, the email sent date is used
+ * for aging; undated rows older than usefulAgeDays and outside the current
+ * month become Skipped.
+ *
+ * A Sunday briefing covers the coming school week. BriefingNotes without a
+ * relevant date use the email sent date for the week filter. Pointers like
+ * "check the office email for important dates" are not parent actions.
  *
  * Advanced (Config flags + Teachers sheet): pin teachers to children, optional
- * vocabulary PDF packets, optional Math Masters practice PDFs. Packets use
- * DocumentApp/DriveApp only (no Cloud Drive API).
+ * Vocabulary Quest PDFs, optional Math Masters practice PDFs (level matrix +
+ * designed worksheets). Packets use DocumentApp/DriveApp only.
  */
 
 const SB = Object.freeze({
+  configSheet: 'Config',
+  teachersSheet: 'Teachers',
   reviewSheet: 'Review',
   processedSheet: 'Processed',
   briefingSheet: 'BriefingNotes',
   briefingProcessedSheet: 'BriefingProcessed',
   previewSheet: 'WeeklyPreview',
-  configSheet: 'Config',
-  teachersSheet: 'Teachers',
   model: 'gemini-2.5-flash',
   maxThreads: 150,
   maxMessagesPerScan: 15,
   maxBodyLength: 20000,
   maxImages: 2,
   maxImageBytes: 4 * 1024 * 1024,
+  usefulAgeDays: 28,
+  mathMastersSheetsPerWeek: 3,
+  mathMastersProblems: 36,
 });
+
+const MATH_MASTERS_LEVELS = Object.freeze([
+  {id: 1, hero: 'THE FLASH', training: 'Level 1: Multiplication by 2, 5, and 10',
+    mode: 'mul', factors: [2, 5, 10], factsLabel: 'multiplication by 2, 5, and 10'},
+  {id: 2, hero: 'BATMAN', training: 'Level 2: Multiplication by 3 and 4',
+    mode: 'mul', factors: [3, 4], factsLabel: 'multiplication by 3 and 4'},
+  {id: 3, hero: 'WONDER WOMAN', training: 'Level 3: Multiplication by 6, 7, and 8',
+    mode: 'mul', factors: [6, 7, 8], factsLabel: 'multiplication by 6, 7, and 8'},
+  {id: 4, hero: 'BLACK PANTHER', training: 'Level 4: Multiplication by 9, 11, and 12',
+    mode: 'mul', factors: [9, 11, 12], factsLabel: 'multiplication by 9, 11, and 12'},
+  {id: 5, hero: 'DIVISION DEFENDER', training: 'Level 5: Division using multiplication facts',
+    mode: 'div', factors: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    factsLabel: 'division using multiplication facts'},
+  {id: 6, hero: 'JUSTICE LEAGUE', training: 'Level 6: Mixed multiplication and division',
+    mode: 'mixed', factors: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    factsLabel: 'mixed multiplication and division'},
+  {id: 7, hero: 'HERO REMATCH',
+    training: 'Level 7: Mixed facts practice (word-problem battles omitted)',
+    mode: 'mixed', factors: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    factsLabel: 'mixed facts'},
+  {id: 8, hero: 'MATH MASTERS', training: 'Final Level: The Math Masters Championship',
+    mode: 'mixed', factors: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    factsLabel: 'Math Masters Championship mix', titlePrefix: 'FINAL'}
+]);
+
+const REVIEW_HEADERS = [
+  'Status', 'Child', 'Type', 'Assignment / Event', 'Due Date (YYYY-MM-DD)',
+  'Due Time (if given)', 'Instructions', 'Teacher Email', 'Email Subject',
+  'Original Email', 'Message ID', 'Calendar Event ID', 'Confidence',
+  'Evidence from Email', 'Candidate ID', 'Created At', 'Error'
+];
+
+const BRIEFING_HEADERS = [
+  'Child', 'Category', 'Headline', 'Details', 'Parent Action',
+  'Relevant Date (YYYY-MM-DD)', 'Teacher Email', 'Email Subject',
+  'Original Email', 'Message ID', 'Received At', 'Confidence',
+  'Evidence from Email', 'Note ID', 'Action Status (Open/Done)'
+];
 
 const CONFIG_HEADERS = ['Key', 'Value', 'Notes'];
 const TEACHER_HEADERS = ['Teacher Email', 'Child', 'Grade'];
@@ -44,56 +91,13 @@ const CONFIG_DEFAULTS = [
   ['family_calendar_id', '', 'Calendar ID / email the bot can edit'],
   ['notify_emails', '', 'Comma-separated parent emails for notices + briefing'],
   ['briefing_hour', '9', 'Sunday briefing hour (0-23), local project timezone'],
-  ['advanced_vocab_packets', 'FALSE', 'TRUE to attach vocab/spelling PDFs'],
+  ['advanced_vocab_packets', 'FALSE', 'TRUE to attach Vocabulary Quest PDFs'],
   ['advanced_math_masters', 'FALSE', 'TRUE to attach Math Masters practice PDFs'],
   ['vocab_children', '', 'Children who get vocab packets (blank = all children)'],
   ['math_masters_children', '', 'Children who get Math Masters packets (blank = all)']
 ];
 
 var CONFIG_CACHE_ = null;
-
-function onOpen() {
-  const ui = SpreadsheetApp.getUi();
-  ui.createMenu('School Bot')
-    .addItem('1. Initialize sheets + Config', 'initializeSchoolBot')
-    .addItem('2. Scan and publish new items', 'scanSchoolEmails')
-    .addItem('3. Publish approved rows', 'publishApprovedRows')
-    .addItem('4. Install 30-minute schedule', 'installSchoolBotTrigger')
-    .addSeparator()
-    .addItem('5. Preview weekly briefing', 'previewWeeklyBriefing')
-    .addItem('6. Send weekly briefing now', 'resendWeeklyBriefing')
-    .addItem('7. Install Sunday briefing schedule', 'installWeeklyBriefingTrigger')
-    .addSeparator()
-    .addSubMenu(ui.createMenu('Advanced')
-      .addItem('Open Config sheet', 'showConfigSheet')
-      .addItem('Open Teachers sheet', 'showTeachersSheet')
-      .addItem('Reload config cache', 'reloadFamilyConfig'))
-    .addToUi();
-}
-
-function initializeSchoolBot() {
-  CONFIG_CACHE_ = null;
-  const book = SpreadsheetApp.getActiveSpreadsheet();
-  ensureConfigSheet_(book);
-  ensureTeachersSheet_(book);
-  ensureSheet_(book, SB.reviewSheet, REVIEW_HEADERS);
-  ensureSheet_(book, SB.processedSheet, ['Message ID', 'Processed At', 'Subject']);
-  ensureSheet_(book, SB.briefingSheet, BRIEFING_HEADERS);
-  ensureSheet_(book, SB.briefingProcessedSheet, ['Message ID', 'Processed At', 'Subject']);
-  const review = book.getSheetByName(SB.reviewSheet);
-  review.getRange('E:E').setNumberFormat('@');
-  review.setFrozenRows(1);
-  const statuses = [
-    'Review', 'Needs date', 'Possible duplicate', 'Possible update',
-    'Approved', 'Added', 'Skipped', 'Error'
-  ];
-  const rule = SpreadsheetApp.newDataValidation()
-    .requireValueInList(statuses, true).setAllowInvalid(false).build();
-  review.getRange(2, 1, Math.max(review.getMaxRows() - 1, 1), 1)
-    .setDataValidation(rule);
-  SpreadsheetApp.getActive().toast(
-    'Sheets ready. Fill Config + Teachers, then set GEMINI_API_KEY in Script Properties.');
-}
 
 function showConfigSheet() {
   ensureConfigSheet_(SpreadsheetApp.getActiveSpreadsheet());
@@ -114,42 +118,6 @@ function reloadFamilyConfig() {
     'Config loaded: ' + cfg.schoolName + ' · ' +
     (cfg.children.join(', ') || 'no children'));
 }
-
-function installSchoolBotTrigger() {
-  ScriptApp.getProjectTriggers()
-    .filter(t => t.getHandlerFunction() === 'runSchoolBot')
-    .forEach(t => ScriptApp.deleteTrigger(t));
-  ScriptApp.newTrigger('runSchoolBot').timeBased().everyMinutes(30).create();
-  SpreadsheetApp.getActive().toast('School Bot will check every 30 minutes.');
-}
-
-function installWeeklyBriefingTrigger() {
-  CONFIG_CACHE_ = null;
-  const cfg = cfg_();
-  assertTimezone_(cfg);
-  const hour = Math.min(23, Math.max(0, Number(cfg.briefingHour) || 9));
-  ScriptApp.getProjectTriggers()
-    .filter(t => t.getHandlerFunction() === 'sendWeeklyBriefing')
-    .forEach(t => ScriptApp.deleteTrigger(t));
-  ScriptApp.newTrigger('sendWeeklyBriefing')
-    .timeBased().onWeekDay(ScriptApp.WeekDay.SUNDAY).atHour(hour).create();
-  SpreadsheetApp.getActive().toast(
-    'Sunday briefing enabled, around ' + hour + ':00 ' + cfg.timezone + '.');
-}
-
-const REVIEW_HEADERS = [
-  'Status', 'Child', 'Type', 'Assignment / Event', 'Due Date (YYYY-MM-DD)',
-  'Due Time (if given)', 'Instructions', 'Teacher Email', 'Email Subject',
-  'Original Email', 'Message ID', 'Calendar Event ID', 'Confidence',
-  'Evidence from Email', 'Candidate ID', 'Created At', 'Error'
-];
-
-const BRIEFING_HEADERS = [
-  'Child', 'Category', 'Headline', 'Details', 'Parent Action',
-  'Relevant Date (YYYY-MM-DD)', 'Teacher Email', 'Email Subject',
-  'Original Email', 'Message ID', 'Received At', 'Confidence',
-  'Evidence from Email', 'Note ID', 'Action Status (Open/Done)'
-];
 
 function cfg_() {
   if (!CONFIG_CACHE_) CONFIG_CACHE_ = loadFamilyConfig_();
@@ -231,9 +199,7 @@ function loadFamilyConfig_() {
     });
   }
   CONFIG_DEFAULTS.forEach(function (row) {
-    if (map[row[0]] == null || map[row[0]] === '') {
-      if (!(row[0] in map)) map[row[0]] = row[1];
-    }
+    if (!(row[0] in map)) map[row[0]] = row[1];
   });
   const props = PropertiesService.getScriptProperties();
   const children = parseCsvList_(map.children);
@@ -281,6 +247,75 @@ function packetChildrenAllowed_(configured, allChildren, child) {
   });
 }
 
+
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('School Bot')
+    .addItem('1. Initialize sheets + Config', 'initializeSchoolBot')
+    .addItem('2. Scan and publish new items', 'scanSchoolEmails')
+    .addItem('3. Publish approved rows', 'publishApprovedRows')
+    .addItem('4. Install 30-minute schedule', 'installSchoolBotTrigger')
+    .addSeparator()
+    .addItem('5. Preview weekly briefing', 'previewWeeklyBriefing')
+    .addItem('6. Send weekly briefing now', 'resendWeeklyBriefing')
+    .addItem('7. Install Sunday briefing schedule', 'installWeeklyBriefingTrigger')
+    .addItem('8. Age undated Needs date rows', 'ageUndatedReviewRows')
+    .addItem('9. Build Math Masters worksheet now', 'buildMathMastersWorksheetNow')
+    .addSeparator()
+    .addSubMenu(ui.createMenu('Advanced')
+      .addItem('Open Config sheet', 'showConfigSheet')
+      .addItem('Open Teachers sheet', 'showTeachersSheet')
+      .addItem('Reload config cache', 'reloadFamilyConfig'))
+    .addToUi();
+}
+
+function initializeSchoolBot() {
+  CONFIG_CACHE_ = null;
+  const book = SpreadsheetApp.getActiveSpreadsheet();
+  ensureConfigSheet_(book);
+  ensureTeachersSheet_(book);
+  ensureSheet_(book, SB.reviewSheet, REVIEW_HEADERS);
+  ensureSheet_(book, SB.processedSheet, ['Message ID', 'Processed At', 'Subject']);
+  ensureSheet_(book, SB.briefingSheet, BRIEFING_HEADERS);
+  ensureSheet_(book, SB.briefingProcessedSheet, ['Message ID', 'Processed At', 'Subject']);
+  const review = book.getSheetByName(SB.reviewSheet);
+  review.getRange('E:E').setNumberFormat('@');
+  review.setFrozenRows(1);
+  const statuses = [
+    'Review', 'Needs date', 'Possible duplicate', 'Possible update',
+    'Approved', 'Added', 'Skipped', 'Error'
+  ];
+  const rule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(statuses, true).setAllowInvalid(false).build();
+  review.getRange(2, 1, Math.max(review.getMaxRows() - 1, 1), 1)
+    .setDataValidation(rule);
+  ageUndatedReviewRows_();
+  SpreadsheetApp.getActive().toast(
+    'Sheets ready. Fill Config + Teachers, then set GEMINI_API_KEY in Script Properties.');
+}
+
+function installSchoolBotTrigger() {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'runSchoolBot')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('runSchoolBot').timeBased().everyMinutes(30).create();
+  SpreadsheetApp.getActive().toast('School Bot will check every 30 minutes.');
+}
+
+function installWeeklyBriefingTrigger() {
+  CONFIG_CACHE_ = null;
+  const cfg = cfg_();
+  assertTimezone_(cfg);
+  const hour = Math.min(23, Math.max(0, Number(cfg.briefingHour) || 9));
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'sendWeeklyBriefing')
+    .forEach(t => ScriptApp.deleteTrigger(t));
+  ScriptApp.newTrigger('sendWeeklyBriefing')
+    .timeBased().onWeekDay(ScriptApp.WeekDay.SUNDAY).atHour(hour).create();
+  SpreadsheetApp.getActive().toast(
+    'Sunday briefing enabled, around ' + hour + ':00 ' + cfg.timezone + '.');
+}
+
 function runSchoolBot() {
   scanSchoolEmails();
   // A previously approved row can be published on the same scheduled run.
@@ -294,6 +329,7 @@ function scanSchoolEmails() {
     const config = configuration_();
     const book = SpreadsheetApp.getActiveSpreadsheet();
     const review = requireSheet_(book, SB.reviewSheet);
+    ageUndatedReviewRows_();
     const processed = requireSheet_(book, SB.processedSheet);
     const briefing = requireSheet_(book, SB.briefingSheet);
     const briefingProcessed = requireSheet_(book, SB.briefingProcessedSheet);
@@ -313,6 +349,7 @@ function scanSchoolEmails() {
     const knownNotes = briefing.getLastRow() > 1
       ? new Set(briefing.getRange(2, 14, briefing.getLastRow() - 1, 1)
           .getValues().map(r => String(r[0]))) : new Set();
+    closePointerActions_(briefing);
     const query = 'label:' + cfg_().gmailLabel + ' newer_than:90d';
     let examined = 0;
     let added = 0;
@@ -346,22 +383,37 @@ function scanSchoolEmails() {
             const title = cleanCell_(item.title, 180);
             if (!title) return;
             const child = childForSender_(sender, item.child);
-            const dueDate = /^\d{4}-\d{2}-\d{2}$/.test(item.dueDate || '')
+            const geminiDue = /^\d{4}-\d{2}-\d{2}$/.test(item.dueDate || '')
               ? item.dueDate : '';
+            const emailDateKey = Utilities.formatDate(message.getDate(), cfg_().timezone, 'yyyy-MM-dd');
+            // No deadline in the email → borrow the sent date so old rows can age out.
+            const dueDate = geminiDue || emailDateKey;
             const match = findSimilar_(known, child, title, dueDate, item.evidence);
             const today = Utilities.formatDate(new Date(), cfg_().timezone, 'yyyy-MM-dd');
-            const status = !dueDate ? 'Needs date'
-              : dueDate < today ? 'Skipped'
-              : match === 'duplicate' ? 'Possible duplicate'
-              : match === 'update' ? 'Possible update'
-              : 'Approved';
+            let status;
+            let errorNote = '';
+            if (!geminiDue) {
+              status = isStillUseful_(dueDate) ? 'Needs date' : 'Skipped';
+              if (status === 'Skipped') {
+                errorNote = 'No due date in email; aged out using email sent ' +
+                  emailDateKey + ' (older than 4 weeks and outside this month).';
+              }
+            } else if (dueDate < today) {
+              status = 'Skipped';
+            } else if (match === 'duplicate') {
+              status = 'Possible duplicate';
+            } else if (match === 'update') {
+              status = 'Possible update';
+            } else {
+              status = 'Approved';
+            }
 
             const row = [
               status, child, cleanCell_(item.type, 60), title, dueDate,
               cleanCell_(item.dueTime, 60), cleanCell_(item.instructions, 45000),
               sender, cleanCell_(message.getSubject(), 300), emailLink,
               messageId, '', Number(item.confidence) || 0,
-              cleanCell_(item.evidence, 600), candidateId, new Date(), ''
+              cleanCell_(item.evidence, 600), candidateId, new Date(), errorNote
             ];
             review.appendRow(row);
             known.push(row);
@@ -374,14 +426,18 @@ function scanSchoolEmails() {
               if (knownNotes.has(noteId) || !item.headline) return;
               const date = /^\d{4}-\d{2}-\d{2}$/.test(item.relevantDate || '')
                 ? item.relevantDate : '';
+              const headline = cleanCell_(item.headline, 250);
+              const details = cleanCell_(item.details, 45000);
+              const action = cleanCell_(item.parentAction, 10000);
+              // Pointers to office/school mail are Done: dated events auto-publish.
+              const actionStatus = !String(action || '').trim() ? ''
+                : isRealAction_(action, details, headline) ? 'Open' : 'Done';
               briefing.appendRow([
                 childForSender_(sender, item.child), cleanCell_(item.category, 80),
-                cleanCell_(item.headline, 250), cleanCell_(item.details, 45000),
-                cleanCell_(item.parentAction, 10000), date, sender,
+                headline, details, action, date, sender,
                 cleanCell_(message.getSubject(), 300), emailLink, messageId,
                 message.getDate(), Number(item.confidence) || 0,
-                cleanCell_(item.evidence, 600), noteId,
-                String(item.parentAction || '').trim() ? 'Open' : ''
+                cleanCell_(item.evidence, 600), noteId, actionStatus
               ]);
               knownNotes.add(noteId);
             });
@@ -507,16 +563,18 @@ function previewWeeklyBriefing() {
   sheet.getRange(3, 1, cells.length, 1).setWrap(true);
 
   let nextRow = 3 + cells.length;
-  const packetNotes = [];
-  (digest.vocabLists || []).forEach(function (list) {
-    packetNotes.push(list.child + ' vocab (' + list.words.length + ' words)');
-  });
-  (digest.mathLists || []).forEach(function (list) {
-    packetNotes.push(list.child + ' Math Masters (×' + list.sets.join('/') + ')');
-  });
-  if (packetNotes.length) {
-    sheet.getRange(nextRow, 1).setValue(
-      'On send, PDF packet(s) attached: ' + packetNotes.join('; ') + '.');
+  if (digest.vocabLists.length) {
+    sheet.getRange(nextRow, 1).setValue('On send, Vocabulary Quest practice + separate answer key for ' +
+      digest.vocabLists.map(function (list) {
+        return list.child + ' (' + list.words.length + ' words)';
+      }).join('; ') + '.');
+    nextRow++;
+  }
+  if (digest.mathMasters && digest.mathMasters.length) {
+    sheet.getRange(nextRow, 1).setValue('On send, Math Masters practice + separate answer key for: ' +
+      digest.mathMasters.map(function (mission) {
+        return mission.label + ' (' + mission.factsLabel + ')';
+      }).join('; ') + '.');
   }
   sheet.setColumnWidth(1, 420);
   sheet.setColumnWidth(2, 420);
@@ -545,13 +603,20 @@ function sendWeeklyBriefing_(force) {
       SpreadsheetApp.getActive().toast('Briefing already sent for this week.');
       return;
     }
-    const attachments = buildBriefingAttachments_(digest);
+    const family = cfg_();
+    const attachments = [];
+    if (family.vocabPackets) {
+      Array.prototype.push.apply(attachments, buildVocabAttachments_(digest));
+    }
+    if (family.mathMasters) {
+      Array.prototype.push.apply(attachments, buildMathMastersAttachments_(digest));
+    }
     const options = {htmlBody: digest.html, name: 'School Email Bot'};
     if (attachments.length) options.attachments = attachments;
     GmailApp.sendEmail(recipients.join(','), digest.subject, digest.plain, options);
     props.setProperty('LAST_BRIEFING_WEEK', digest.weekKey);
     console.log('Weekly briefing sent for ' + digest.weekKey +
-      (attachments.length ? ' with ' + attachments.length + ' packet(s).' : '.'));
+      (attachments.length ? ' with ' + attachments.length + ' vocab packet(s).' : '.'));
     SpreadsheetApp.getActive().toast('Weekly briefing sent.');
   } finally {
     lock.releaseLock();
@@ -560,9 +625,7 @@ function sendWeeklyBriefing_(force) {
 
 function briefingRecipients_() {
   const list = cfg_().notifyEmails.slice();
-  if (!list.length) {
-    throw new Error('Set notify_emails on the Config sheet (or NOTIFY_EMAILS in Script Properties).');
-  }
+  if (!list.length) throw new Error('Set notify_emails on the Config sheet (or NOTIFY_EMAILS in Script Properties).');
   return list;
 }
 
@@ -572,10 +635,11 @@ function buildWeeklyBriefing_(anchorDate) {
   const book = SpreadsheetApp.getActiveSpreadsheet();
   const review = requireSheet_(book, SB.reviewSheet);
   const notesSheet = requireSheet_(book, SB.briefingSheet);
+  closePointerActions_(notesSheet);
+  ageUndatedReviewRows_();
   const window = schoolWeek_(anchorDate);
   const weekStart = localDateKey_(window.start);
   const weekEnd = localDateKey_(window.end);
-  const cutoff = new Date(anchorDate.getTime() - 7 * 86400000);
 
   const confirmed = [];
   const pending = [];
@@ -599,7 +663,12 @@ function buildWeeklyBriefing_(anchorDate) {
     }
     // Human triage only: needs a date, possible duplicate, or possible update.
     if (!isTriageStatus_(status)) return;
-    if (status === 'Needs date' || inWeek || later) pending.push(item);
+    if (status === 'Needs date') {
+      // Email-sent fallback dates: keep while within 4 weeks or this month.
+      if (dueKey && isStillUseful_(dueKey)) pending.push(item);
+      return;
+    }
+    if (inWeek || later) pending.push(item);
   });
   confirmed.sort((a, b) => a.date.localeCompare(b.date) || a.child.localeCompare(b.child));
   pending.sort((a, b) => a.date.localeCompare(b.date) || a.child.localeCompare(b.child));
@@ -612,29 +681,31 @@ function buildWeeklyBriefing_(anchorDate) {
     rows.slice().reverse().forEach(row => {
       const relevant = parseLocalDate_(row[5]);
       const relevantKey = relevant ? localDateKey_(relevant) : '';
-      const inWeek = relevantKey >= weekStart && relevantKey <= weekEnd;
-      const recent = row[10] instanceof Date && row[10] >= cutoff;
+      const emailDate = parseLocalDate_(row[10]);
+      const emailKey = emailDate ? localDateKey_(emailDate) : '';
+      // No relevant date → the email's sent date is the week of the action.
+      const effectiveKey = relevantKey || emailKey;
+      if (!effectiveKey) return;
+      const inWeek = effectiveKey >= weekStart && effectiveKey <= weekEnd;
       const actionText = String(row[4] || '').trim();
-      const realAction = isRealAction_(actionText);
+      const headline = String(row[2] || '');
+      const details = String(row[3] || '');
+      const realAction = isRealAction_(actionText, details, headline);
       const actionDone = String(row[14] || '').trim().toLowerCase() === 'done';
-      if (realAction && actionDone) return;
-      if (relevantKey) {
-        if (realAction) {
-          // Open actions: this week or later. Past due actions drop off.
-          if (relevantKey < weekStart) return;
-        } else if (!inWeek) {
-          // Class notes only for the coming week.
-          return;
-        }
-      } else if (!recent) {
-        // Undated notes only if the email landed in the last 7 days.
+      // Done rows stay on the sheet for audit but drop off the briefing.
+      if (actionDone) return;
+      if (realAction) {
+        // Open actions: this week or later. Past-week email dates drop off.
+        if (effectiveKey < weekStart) return;
+      } else if (!inWeek) {
+        // Class notes only for the coming week.
         return;
       }
       const item = {
         child: String(row[0] || 'School'), category: String(row[1] || 'Update'),
         headline: String(row[2] || ''),
         details: String(row[3] || '').replace(/^'/, ''),
-        action: actionText.replace(/^'/, ''), date: relevantKey,
+        action: actionText.replace(/^'/, ''), date: effectiveKey,
         link: String(row[8] || '')
       };
       if (!item.headline) return;
@@ -646,14 +717,14 @@ function buildWeeklyBriefing_(anchorDate) {
   }
   const uniqueConfirmed = dedupeBriefing_(confirmed);
   const uniquePending = dedupeBriefing_(pending);
-  const actions = notes.filter(n => isRealAction_(n.action));
-  const announcements = notes.filter(n => !isRealAction_(n.action));
+  const actions = notes.filter(n => isRealAction_(n.action, n.details, n.headline));
+  const announcements = notes.filter(n => !isRealAction_(n.action, n.details, n.headline));
   const reviewRows = readReviewRows_(review);
   const vocabLists = family.vocabPackets
     ? vocabListsForWeek_(reviewRows, weekStart, weekEnd, family)
     : [];
-  const mathLists = family.mathMasters
-    ? mathMastersListsForWeek_(reviewRows, weekStart, weekEnd, family)
+  const mathMasters = family.mathMasters
+    ? mathMastersForWeek_(reviewRows, weekStart, weekEnd, family)
     : [];
   const dateLabel = Utilities.formatDate(window.start, family.timezone, 'MMM d') + '–' +
     Utilities.formatDate(window.end, family.timezone, 'MMM d, yyyy');
@@ -667,7 +738,7 @@ function buildWeeklyBriefing_(anchorDate) {
     announcements: announcements,
     pending: uniquePending,
     vocabLists: vocabLists,
-    mathLists: mathLists,
+    mathMasters: mathMasters,
     sheetUrl: book.getUrl(),
     brand: {
       schoolName: family.schoolName,
@@ -679,11 +750,29 @@ function buildWeeklyBriefing_(anchorDate) {
   });
   return {
     subject: subject, plain: rendered.plain, html: rendered.html,
-    weekKey: weekStart, vocabLists: vocabLists, mathLists: mathLists
+    weekKey: weekStart, vocabLists: vocabLists, mathMasters: mathMasters
   };
 }
 
-function isRealAction_(action) {
+/**
+ * "Check the school office email for important dates" is not a parent to-do.
+ * Dated school events from that office mail auto-publish when scanned.
+ */
+function isPointerToSchoolMail_(action, details, headline) {
+  const blob = [action, details, headline].map(function (v) {
+    return String(v || '');
+  }).join(' ');
+  if (!/\S/.test(blob)) return false;
+  if (/\b(check|see|refer to|look (?:at|in)|find|available in|listed in)\b[\s\S]{0,100}\b(?:lsa\s+office|office\s+e-?mail|school\s+office|school\s+e-?mail)\b/i.test(blob)) {
+    return true;
+  }
+  if (/\bimportant\s+(?:school\s+)?dates?\b[\s\S]{0,80}\b(?:lsa\s+office|office\s+e-?mail|school\s+e-?mail)\b/i.test(blob)) {
+    return true;
+  }
+  return false;
+}
+
+function isRealAction_(action, details, headline) {
   const text = String(action || '').trim();
   if (!text) return false;
   if (/^(none|n\/a|na|no|nothing|null|-|no action\.?|no specific action\.?|none needed\.?|for awareness\.?|await further communication\.?)$/i.test(text)) {
@@ -691,7 +780,110 @@ function isRealAction_(action) {
   }
   if (/^(no action|none needed|for awareness|no specific action)\b/i.test(text)) return false;
   if (/^optional:\s*(view|attend|review|play|take|sign up to volunteer)\b/i.test(text)) return false;
+  if (isPointerToSchoolMail_(action, details, headline)) return false;
   return true;
+}
+
+/** Menu: fill blank Needs date rows from the original email's sent date. */
+function ageUndatedReviewRows() {
+  const result = ageUndatedReviewRows_();
+  SpreadsheetApp.getActive().toast(
+    'Filled ' + result.filled + ' date(s); skipped ' + result.skipped + ' old undated row(s).'
+  );
+}
+
+/**
+ * Needs date with no due date: look up Gmail by Message ID, write the email's
+ * sent day as Due Date, and Skipped when older than 4 weeks and outside this month.
+ */
+function ageUndatedReviewRows_() {
+  const book = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = book.getSheetByName(SB.reviewSheet);
+  if (!sheet || sheet.getLastRow() < 2) return {filled: 0, skipped: 0};
+  const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, REVIEW_HEADERS.length).getValues();
+  const cache = new Map();
+  let filled = 0;
+  let skipped = 0;
+
+  rows.forEach(function (row, index) {
+    const status = String(row[0] || '').trim();
+    if (status !== 'Needs date') return;
+    const rowNumber = index + 2;
+    let dueKey = '';
+    const existing = parseLocalDate_(row[4]);
+    if (existing) dueKey = localDateKey_(existing);
+
+    if (!dueKey) {
+      const messageId = String(row[10] || '').trim();
+      if (!messageId) return;
+      if (!cache.has(messageId)) {
+        try {
+          const message = GmailApp.getMessageById(messageId);
+          cache.set(
+            messageId,
+            Utilities.formatDate(message.getDate(), cfg_().timezone, 'yyyy-MM-dd')
+          );
+        } catch (error) {
+          console.error('ageUndatedReviewRows_: ' + messageId + ' — ' +
+            String(error.message || error));
+          cache.set(messageId, '');
+        }
+      }
+      dueKey = cache.get(messageId) || '';
+      if (!dueKey) return;
+      sheet.getRange(rowNumber, 5).setNumberFormat('@').setValue(dueKey);
+      filled++;
+    }
+
+    if (!isStillUseful_(dueKey)) {
+      sheet.getRange(rowNumber, 1).setValue('Skipped');
+      sheet.getRange(rowNumber, 17).setValue(
+        'No due date in email; aged out using email sent ' + dueKey +
+          ' (older than 4 weeks and outside this month).'
+      );
+      skipped++;
+    }
+  });
+
+  if (filled || skipped) {
+    console.log('Aged Needs date rows: filled ' + filled + ', skipped ' + skipped + '.');
+  }
+  return {filled: filled, skipped: skipped};
+}
+
+/** Keep if within the last 4 weeks, or still in the current calendar month. */
+function isStillUseful_(yyyyMmDd) {
+  const date = parseLocalDate_(yyyyMmDd);
+  if (!date) return false;
+  const todayKey = Utilities.formatDate(new Date(), cfg_().timezone, 'yyyy-MM-dd');
+  const today = parseLocalDate_(todayKey);
+  if (!today) return false;
+  if (date.getFullYear() === today.getFullYear() && date.getMonth() === today.getMonth()) {
+    return true;
+  }
+  const oldest = new Date(today.getFullYear(), today.getMonth(), today.getDate() - SB.usefulAgeDays);
+  return date >= oldest;
+}
+
+/** Mark open "check office email for dates" notes Done so they leave the brief. */
+function closePointerActions_(briefing) {
+  if (!briefing) return 0;
+  const last = briefing.getLastRow();
+  if (last < 2) return 0;
+  const width = BRIEFING_HEADERS.length;
+  const values = briefing.getRange(2, 1, last, width).getValues();
+  let closed = 0;
+  values.forEach(function (row, index) {
+    const status = String(row[14] || '').trim().toLowerCase();
+    if (status === 'done') return;
+    if (!isPointerToSchoolMail_(row[4], row[3], row[2])) return;
+    briefing.getRange(index + 2, 15).setValue('Done');
+    closed++;
+  });
+  if (closed) {
+    console.log('Closed ' + closed + ' office-email pointer note(s).');
+  }
+  return closed;
 }
 
 /** Keep useful detail without pasting the whole teacher email into the digest. */
@@ -911,32 +1103,37 @@ function renderBriefing_(model) {
   }
   html.push('</td></tr>');
 
-  // Advanced packets
-  if ((model.vocabLists && model.vocabLists.length) || (model.mathLists && model.mathLists.length)) {
-    html.push('<tr><td style="padding:18px 32px 22px;border-top:1px solid #e7e9e1;background-color:#fffefa">');
-    if (model.vocabLists && model.vocabLists.length) {
-      html.push('<h2 style="margin:0 0 10px;color:#26352d;font-family:Georgia,\'Times New Roman\',serif;' +
-        'font-size:18px;line-height:24px;font-weight:400">Spelling and vocabulary</h2>');
-      model.vocabLists.forEach(function (list) {
-        html.push('<p style="margin:0 0 8px;color:#26352d;font-size:12px;line-height:18px"><strong>' +
-          escapeHtml_(list.child) + '</strong> — ' + escapeHtml_(list.words.join(', ')) + '</p>');
-        if (list.notes.length) {
-          html.push('<p style="margin:0 0 8px;color:#65756c;font-size:11px;line-height:16px">' +
-            escapeHtml_(list.notes.join(' ')) + '</p>');
-        }
-      });
-    }
-    if (model.mathLists && model.mathLists.length) {
-      html.push('<h2 style="margin:16px 0 10px;color:#26352d;font-family:Georgia,\'Times New Roman\',serif;' +
-        'font-size:18px;line-height:24px;font-weight:400">Math Masters</h2>');
-      model.mathLists.forEach(function (list) {
-        html.push('<p style="margin:0 0 8px;color:#26352d;font-size:12px;line-height:18px"><strong>' +
-          escapeHtml_(list.child) + '</strong> — multiples of ' +
-          escapeHtml_(list.sets.join(', ')) + '</p>');
-      });
-    }
+  // Vocab
+  if (model.vocabLists.length) {
+    html.push('<tr><td style="padding:18px 32px 22px;border-top:1px solid #e7e9e1;background-color:#fffefa">' +
+      '<h2 style="margin:0 0 10px;color:#26352d;font-family:Georgia,\'Times New Roman\',serif;' +
+      'font-size:18px;line-height:24px;font-weight:400">Spelling and vocabulary</h2>');
+    model.vocabLists.forEach(function (list) {
+      html.push('<p style="margin:0 0 8px;color:#26352d;font-size:12px;line-height:18px"><strong>' +
+        escapeHtml_(list.child) + '</strong> — ' + escapeHtml_(list.words.join(', ')) + '</p>');
+      if (list.notes.length) {
+        html.push('<p style="margin:0 0 8px;color:#65756c;font-size:11px;line-height:16px">' +
+          escapeHtml_(list.notes.join(' ')) + '</p>');
+      }
+    });
     html.push('<p style="margin:0;color:#65756c;font-size:10px;line-height:15px">' +
-      'Printable packet(s) are attached when this briefing is sent.</p></td></tr>');
+      'Vocabulary Quest child worksheets plus a separate parent answer-key file attach when this briefing is sent.</p></td></tr>');
+  }
+
+  // Math Masters
+  if (model.mathMasters && model.mathMasters.length) {
+    html.push('<tr><td style="padding:18px 32px 22px;border-top:1px solid #e7e9e1;background-color:#fffefa">' +
+      '<h2 style="margin:0 0 10px;color:#26352d;font-family:Georgia,\'Times New Roman\',serif;' +
+      'font-size:18px;line-height:24px;font-weight:400">Math Masters practice</h2>');
+    model.mathMasters.forEach(function (mission) {
+      html.push('<p style="margin:0 0 8px;color:#26352d;font-size:12px;line-height:18px"><strong>' +
+        escapeHtml_(mission.child) + '</strong> — ' + escapeHtml_(mission.label) +
+        ' (' + escapeHtml_(mission.factsLabel) + ')</p>');
+    });
+    html.push('<p style="margin:0;color:#65756c;font-size:10px;line-height:15px">' +
+      SB.mathMastersSheetsPerWeek +
+      ' randomized child practice sheets plus a separate parent answer-key file attach when this briefing is sent. ' +
+      'No word problems.</p></td></tr>');
   }
 
   // Sources / review sheet
@@ -1098,8 +1295,8 @@ function buildBriefingPlain_(model, exceptions, summary, reminder, updates) {
     if (reminder.action) plain.push(reminder.action);
     if (reminder.link) plain.push('Open email: ' + reminder.link);
   }
-  const brand = model.brand || {schoolShortName: 'School', familyName: 'Your family', schoolName: 'Your School'};
-  plain.push('\nAROUND ' + String(brand.schoolShortName || 'SCHOOL').toUpperCase());
+  const brandPlain = model.brand || {schoolShortName: 'School'};
+  plain.push('\nAROUND ' + String(brandPlain.schoolShortName || 'SCHOOL').toUpperCase());
   if (!updates.length) {
     plain.push('Nothing else needs attention beyond the calendar this week.');
   } else {
@@ -1128,17 +1325,19 @@ function buildBriefingPlain_(model, exceptions, summary, reminder, updates) {
       if (item.link) plain.push('Open email: ' + item.link);
     });
   }
-  if (model.vocabLists && model.vocabLists.length) {
+  if (model.vocabLists.length) {
     plain.push('\nSPELLING AND VOCABULARY');
     model.vocabLists.forEach(function (list) {
       plain.push(list.child + ' — ' + list.words.join(', '));
     });
   }
-  if (model.mathLists && model.mathLists.length) {
-    plain.push('\nMATH MASTERS');
-    model.mathLists.forEach(function (list) {
-      plain.push(list.child + ' — multiples of ' + list.sets.join(', '));
+  if (model.mathMasters && model.mathMasters.length) {
+    plain.push('\nMATH MASTERS PRACTICE');
+    model.mathMasters.forEach(function (mission) {
+      plain.push(mission.child + ' — ' + mission.label + ' (' + mission.factsLabel + ')');
     });
+    plain.push(SB.mathMastersSheetsPerWeek +
+      ' randomized child sheets + separate parent answer-key file attach on send.');
   }
   if (model.sheetUrl) plain.push('\nReview sheet: ' + model.sheetUrl);
   plain.push('\nOriginal teacher emails are the source. This note can miss a detail.');
@@ -1194,11 +1393,12 @@ function openEmailHtml_(url) {
 }
 
 /**
- * Advanced: vocabulary/spelling packet candidates for the week.
+ * Advanced: Vocabulary Quest packet candidates for the week.
  * A list counts when a Review row due this week names vocabulary or
  * spelling and the instructions include the teacher's word list.
  */
 function vocabListsForWeek_(rows, weekStart, weekEnd, family) {
+  family = family || cfg_();
   const groups = new Map();
   rows.forEach(function (row) {
     const status = String(row[0] || '').trim();
@@ -1225,57 +1425,6 @@ function vocabListsForWeek_(rows, weekStart, weekEnd, family) {
     });
   });
   return Array.from(groups.values());
-}
-
-/**
- * Advanced: Math Masters / multiplication-fact practice from teacher emails.
- * Parses "multiples of 2, 5, 10" style lines from instructions.
- */
-function mathMastersListsForWeek_(rows, weekStart, weekEnd, family) {
-  const groups = new Map();
-  rows.forEach(function (row) {
-    const status = String(row[0] || '').trim();
-    if (status === 'Skipped' || status === 'Possible duplicate' || status === 'Error') return;
-    const child = String(row[1] || '').trim();
-    if (!packetChildrenAllowed_(family.mathChildren, family.children, child)) return;
-    const due = parseLocalDate_(row[4]);
-    const dueKey = due ? localDateKey_(due) : '';
-    if (!dueKey || dueKey < weekStart || dueKey > weekEnd) return;
-    const blob = [row[2], row[3], row[6], row[13]].join(' ');
-    if (!/math masters|math facts|multiplication|multiples of/i.test(blob)) return;
-    const sets = parseMathMasterSets_(String(row[6] || '') + '\n' + String(row[13] || ''));
-    if (!sets.length) return;
-    const key = child + '|' + sets.join('|');
-    if (groups.has(key)) return;
-    groups.set(key, {
-      child: child,
-      sets: sets,
-      title: String(row[3] || 'Math Masters'),
-      due: dueKey
-    });
-  });
-  return Array.from(groups.values());
-}
-
-function parseMathMasterSets_(text) {
-  const source = String(text || '');
-  const found = [];
-  const seen = {};
-  const re = /multiples?\s+of\s+([0-9,\sand]+)/gi;
-  let match;
-  while ((match = re.exec(source))) {
-    String(match[1]).split(/,|\band\b/i).forEach(function (part) {
-      const n = Number(String(part).replace(/[^0-9]/g, ''));
-      if (!n || n < 1 || n > 12 || seen[n]) return;
-      seen[n] = true;
-      found.push(n);
-    });
-  }
-  if (found.length) return found.sort(function (a, b) { return a - b; });
-  if (/math masters|math facts|multiplication/i.test(source)) {
-    return [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
-  }
-  return [];
 }
 
 function parseWordList_(text) {
@@ -1307,100 +1456,25 @@ function parseWordList_(text) {
   return {words: words, notes: notes};
 }
 
-function buildBriefingAttachments_(digest) {
+function buildVocabAttachments_(digest) {
+  if (!digest.vocabLists.length) return [];
   const notes = [];
   const attachments = [];
-  (digest.vocabLists || []).forEach(function (list) {
+  digest.vocabLists.forEach(function (list) {
     try {
       const packet = generateVocabPacket_(list, digest.weekKey);
-      attachments.push(packet.blob);
-      notes.push(list.child + ': spelling and vocabulary packet attached (' +
-        packet.blob.getName() + '). The answer key is the last page.');
+      attachments.push(packet.practiceBlob);
+      attachments.push(packet.answerBlob);
+      notes.push(list.child + ': Vocabulary Quest worksheets attached (' +
+        packet.practiceBlob.getName() + '). Parent answer keys are separate (' +
+        packet.answerBlob.getName() + ').');
     } catch (error) {
       console.error('Vocab packet failed: ' + String(error.message || error));
-      notes.push(list.child + ': vocab packet was not attached. ' + String(error.message || error));
-    }
-  });
-  (digest.mathLists || []).forEach(function (list) {
-    try {
-      const packet = generateMathMastersPacket_(list, digest.weekKey);
-      attachments.push(packet.blob);
-      notes.push(list.child + ': Math Masters packet attached (' +
-        packet.blob.getName() + '). The answer key is the last page.');
-    } catch (error) {
-      console.error('Math Masters packet failed: ' + String(error.message || error));
-      notes.push(list.child + ': Math Masters packet was not attached. ' +
-        String(error.message || error));
+      notes.push(list.child + ': packet was not attached. ' + String(error.message || error));
     }
   });
   appendBriefingLines_(digest, notes);
   return attachments;
-}
-
-function generateMathMastersPacket_(list, weekKey) {
-  const sets = (list.sets || []).slice();
-  if (!sets.length) throw new Error('Need at least one multiplication set.');
-  const seed = weekKey + '|math|' + list.child + '|' + sets.join('|');
-  const problems = buildMathMasterProblems_(sets, seed, 24);
-  const mixed = buildMathMasterProblems_(sets, seed + ':mixed', 16);
-  const html = buildMathMastersHtml_(list.child, sets, problems, mixed);
-  const slug = normalize_(list.title).replace(/\s+/g, '-').slice(0, 40) || 'math-masters';
-  const filename = list.child + '-' + slug + '-' + weekKey + '.pdf';
-  return {blob: htmlToPdfBlob_(html, filename)};
-}
-
-function buildMathMasterProblems_(sets, seed, count) {
-  const problems = [];
-  let i = 0;
-  while (problems.length < count) {
-    const table = sets[i % sets.length];
-    const other = 1 + (hashSeed_(seed + ':' + problems.length) % 12);
-    const a = (hashSeed_(seed + ':flip:' + problems.length) % 2) ? table : other;
-    const b = a === table ? other : table;
-    problems.push({a: a, b: b, answer: a * b});
-    i++;
-  }
-  return problems;
-}
-
-function buildMathMastersHtml_(child, sets, problems, mixed) {
-  const pages = [];
-  pages.push(packetPage_([
-    '<h1>Math Masters — Fact practice</h1>',
-    nameDateLine_(child),
-    '<p>This week\'s sets: multiples of ' + escapeHtml_(sets.join(', ')) + '.</p>',
-    '<h2>Warm-up</h2>',
-    '<p>Solve each fact. Work down the page.</p>',
-    tableHtml_([['Fact', 'Answer']].concat(problems.map(function (item) {
-      return [escapeHtml_(item.a + ' × ' + item.b), '________'];
-    })))
-  ].join('')));
-  pages.push(packetPage_([
-    '<h1>Math Masters — Mixed review</h1>',
-    nameDateLine_(child),
-    '<h2>Mixed facts</h2>',
-    tableHtml_([['Fact', 'Answer']].concat(mixed.map(function (item) {
-      return [escapeHtml_(item.a + ' × ' + item.b), '________'];
-    }))),
-    '<h2>Missed ones</h2>',
-    '<p>Write any facts you missed and solve them again.</p>',
-    '<p>________________________________</p>',
-    '<p>________________________________</p>',
-    '<p>________________________________</p>'
-  ].join('')));
-  pages.push(packetPage_([
-    '<h1>Answer key — Parent / caregiver</h1>',
-    '<p>Sets: multiples of ' + escapeHtml_(sets.join(', ')) + '</p>',
-    '<h2>Warm-up</h2>',
-    '<ol>' + problems.map(function (item) {
-      return '<li>' + escapeHtml_(item.a + ' × ' + item.b + ' = ' + item.answer) + '</li>';
-    }).join('') + '</ol>',
-    '<h2>Mixed review</h2>',
-    '<ol>' + mixed.map(function (item) {
-      return '<li>' + escapeHtml_(item.a + ' × ' + item.b + ' = ' + item.answer) + '</li>';
-    }).join('') + '</ol>'
-  ].join('')));
-  return '<!DOCTYPE html><html><body>' + pages.join('') + '</body></html>';
 }
 
 function appendBriefingLines_(digest, lines) {
@@ -1412,10 +1486,526 @@ function appendBriefingLines_(digest, lines) {
     }).join('') + '</div>';
 }
 
+/** Menu: build a Math Masters packet and email it to the parents. */
+function buildMathMastersWorksheetNow() {
+  const book = SpreadsheetApp.getActiveSpreadsheet();
+  const review = requireSheet_(book, SB.reviewSheet);
+  const window = schoolWeek_(new Date());
+  const weekStart = localDateKey_(window.start);
+  const weekEnd = localDateKey_(window.end);
+  const weekKey = weekStart;
+  const missions = resolveMathMastersMissions_(
+    readReviewRows_(review), weekStart, weekEnd, {forMenu: true}
+  );
+  const digest = {
+    weekKey: weekKey,
+    mathMasters: missions,
+    plain: '',
+    html: ''
+  };
+  const attachments = buildMathMastersAttachments_(digest);
+  if (!attachments.length) {
+    SpreadsheetApp.getActive().toast('Math Masters PDF failed. Check Executions log.');
+    return;
+  }
+  const recipients = briefingRecipients_();
+  GmailApp.sendEmail(
+    recipients.join(','),
+    'Math Masters practice — ' + weekKey,
+    missions.map(function (mission) {
+      return mission.label + ' (' + mission.factsLabel + ')' +
+        (mission.source ? ' [' + mission.source + ']' : '');
+    }).join('\n') +
+      '\n\n' + SB.mathMastersSheetsPerWeek +
+      ' randomized child practice sheets + a separate parent answer-key file are attached.',
+    {attachments: attachments, name: 'School Email Bot'}
+  );
+  SpreadsheetApp.getActive().toast(
+    'Math Masters emailed: ' + missions.map(function (m) { return m.factsLabel; }).join('; ')
+  );
+}
+
+function buildMathMastersAttachments_(digest) {
+  if (!digest.mathMasters || !digest.mathMasters.length) return [];
+  const notes = [];
+  const attachments = [];
+  try {
+    const packet = generateMathMastersPacket_(digest.mathMasters, digest.weekKey);
+    attachments.push(packet.practiceBlob);
+    attachments.push(packet.answerBlob);
+    const who = (digest.mathMasters && digest.mathMasters[0] && digest.mathMasters[0].child) ||
+      'Student';
+    notes.push(who + ': Math Masters child worksheets attached (' +
+      packet.practiceBlob.getName() + ') — ' + SB.mathMastersSheetsPerWeek +
+      ' randomized practice sheets. Parent answer keys are a separate file (' +
+      packet.answerBlob.getName() + ').');
+  } catch (error) {
+    console.error('Math Masters packet failed: ' + String(error.message || error));
+    notes.push('Math Masters packet was not attached. ' + String(error.message || error));
+  }
+  appendBriefingLines_(digest, notes);
+  return attachments;
+}
+
+function mathMastersForWeek_(rows, weekStart, weekEnd, family) {
+  return resolveMathMastersMissions_(rows, weekStart, weekEnd, {forMenu: false, family: family});
+}
+
 /**
- * Builds a Tue/Wed/Thu vocabulary worksheet packet from a fixed template.
+ * 1) Due this week from Review emails
+ * 2) Menu only: still-useful / recent Math Masters rows (even Skipped)
+ * 3) Menu only: challenge matrix Level 1 when nothing is on the sheet
+ */
+function resolveMathMastersMissions_(rows, weekStart, weekEnd, opts) {
+  opts = opts || {};
+  const family = opts.family || cfg_();
+  let missions = collectMathMastersMissions_(rows, family, function (row, dueKey, status) {
+    if (status === 'Skipped' || status === 'Possible duplicate' || status === 'Error') return false;
+    return dueKey && dueKey >= weekStart && dueKey <= weekEnd;
+  });
+  if (!missions.length && opts.forMenu) {
+    missions = collectMathMastersMissions_(rows, family, function (row, dueKey, status) {
+      if (status === 'Possible duplicate' || status === 'Error') return false;
+      if (dueKey && isStillUseful_(dueKey)) return true;
+      // Old/Skipped rows still usable when they name a Test/Level for the matrix.
+      const blob = [row[2], row[3], row[6], row[13]].join(' ');
+      return /\b(?:test|level|mission)\s*[1-8]\b/i.test(blob) ||
+        /\bfinal(?:\s+level)?\b|\bchampionship\b/i.test(blob);
+    });
+  }
+  if (!missions.length && opts.forMenu) {
+    const fallback = missionFromLevel_(MATH_MASTERS_LEVELS[0]);
+    fallback.child = family.children[0] || 'Student';
+    fallback.title = 'Math Masters Level 1';
+    fallback.due = weekStart;
+    fallback.source = 'challenge matrix Level 1 (no Review row / no email multiples)';
+    missions = [fallback];
+  }
+  return missions;
+}
+
+function collectMathMastersMissions_(rows, family, includeRow) {
+  const missions = [];
+  const seen = new Set();
+  rows.forEach(function (row) {
+    const status = String(row[0] || '').trim();
+    const child = String(row[1] || '').trim();
+    if (!packetChildrenAllowed_(family.mathChildren, family.children, child)) return;
+    const due = parseLocalDate_(row[4]);
+    const dueKey = due ? localDateKey_(due) : '';
+    if (!includeRow(row, dueKey, status)) return;
+    const blob = [row[2], row[3], row[6], row[13]].join(' ');
+    if (!/multiplication\s*masters|math\s*masters|timed\s*multiplication|math\s*facts/i.test(blob)) {
+      return;
+    }
+    const parsed = parseMathMastersFromEmail_(blob);
+    if (!parsed || !parsed.factors.length) return;
+    const key = child + '|' + parsed.mode + '|' + parsed.factors.join(',');
+    if (seen.has(key)) return;
+    seen.add(key);
+    missions.push({
+      child: child,
+      label: parsed.label,
+      hero: parsed.hero,
+      training: parsed.training,
+      mode: parsed.mode,
+      factors: parsed.factors,
+      factsLabel: parsed.factsLabel,
+      source: parsed.source,
+      title: String(row[3] || 'Math Masters'),
+      due: dueKey
+    });
+  });
+  return missions.slice(0, 4);
+}
+
+/**
+ * Email multiples win. Else Test/Level N uses the challenge matrix.
+ * Else any Math Masters mention falls back to matrix Level 1.
+ */
+function parseMathMastersFromEmail_(text) {
+  const source = String(text || '');
+  const lower = source.toLowerCase();
+  const mode = /\bdivision\b/.test(lower) && !/\bmultiplication\b/.test(lower) ? 'div'
+    : /\bmixed\b/.test(lower) ? 'mixed'
+    : /\bchampionship\b|\bfinal\b/.test(lower) ? 'mixed' : 'mul';
+
+  const factors = extractFactorsFromText_(source);
+  if (factors.length) {
+    const matched = MATH_MASTERS_LEVELS.find(function (level) {
+      if (level.mode !== 'mul') return false;
+      if (level.factors.length !== factors.length) return false;
+      return level.factors.every(function (n) { return factors.indexOf(n) !== -1; });
+    });
+    if (matched) {
+      const fromLevel = missionFromLevel_(matched);
+      fromLevel.source = 'email facts → matrix Level ' + matched.id;
+      return fromLevel;
+    }
+    return {
+      label: 'FROM EMAIL | HERO TRAINING',
+      hero: 'HERO TRAINING',
+      training: 'Facts named in this week\'s school email',
+      mode: mode,
+      factors: factors,
+      factsLabel: factorsLabel_(factors),
+      source: 'email facts'
+    };
+  }
+
+  const testMatch = lower.match(/\b(?:test|level|mission)\s*([1-8]|final)\b/) ||
+    lower.match(/\bfinal\s+level\b/) ||
+    lower.match(/\bchampionship\b/);
+  if (testMatch) {
+    let id = 8;
+    if (testMatch[1] && testMatch[1] !== 'final') id = Number(testMatch[1]);
+    else if (/\bfinal\b|\bchampionship\b/.test(testMatch[0])) id = 8;
+    const level = MATH_MASTERS_LEVELS.find(function (item) { return item.id === id; });
+    if (level) {
+      const fromLevel = missionFromLevel_(level);
+      fromLevel.source = 'challenge matrix Level ' + id;
+      return fromLevel;
+    }
+  }
+
+  if (/multiplication\s*masters|math\s*masters|timed\s*multiplication|math\s*facts/i.test(source)) {
+    const fromLevel = missionFromLevel_(MATH_MASTERS_LEVELS[0]);
+    fromLevel.source = 'challenge matrix Level 1 (no multiples listed in email)';
+    return fromLevel;
+  }
+  return null;
+}
+
+function missionFromLevel_(level) {
+  const prefix = level.titlePrefix || ('LEVEL ' + level.id);
+  return {
+    label: prefix + ' | ' + level.hero,
+    hero: level.hero,
+    training: level.training,
+    mode: level.mode,
+    factors: level.factors.slice(),
+    factsLabel: level.factsLabel,
+    source: 'level ' + level.id
+  };
+}
+
+function factorsLabel_(factors) {
+  return factors.map(function (n) { return n + 's'; }).join(', ') + ' facts';
+}
+
+/**
+ * Pull only clearly named fact families from the email — not Test/Level
+ * numbers, dates, or scores.
+ */
+function extractFactorsFromText_(text) {
+  const found = new Set();
+  const source = String(text || '')
+    .replace(/\b(?:test|level|mission)\s*[1-8]\b/gi, ' ')
+    .replace(/\b(?:final)\b/gi, ' ');
+
+  function addList(chunk) {
+    String(chunk || '').replace(/[^0-9]+/g, ' ').trim().split(/\s+/).forEach(function (part) {
+      const n = Number(part);
+      if (n >= 2 && n <= 12) found.add(n);
+    });
+  }
+
+  let match;
+  // 2s, 5s, and 10s / 2's 5's 10's
+  const sForm = /\b([0-9]{1,2})\s*'?s\b/gi;
+  while ((match = sForm.exec(source))) addList(match[1]);
+
+  // ×2 ×5 ×10 / x2 x5
+  const xForm = /(?:×|x)\s*([0-9]{1,2})\b/gi;
+  while ((match = xForm.exec(source))) addList(match[1]);
+
+  // facts for 2, 5, and 10 / multiples of 3 and 4 / times tables 6, 7, 8
+  const labeled = [
+    /(?:facts?|multiples?|times\s+tables?)\s*(?:for|on|of|with|:)?\s*([0-9]{1,2}(?:\s*(?:,|&|and)\s*[0-9]{1,2}){1,5})/gi,
+    /multipl(?:y|ying|ication)\s+by\s+([0-9]{1,2}(?:\s*(?:,|&|and)\s*[0-9]{1,2}){0,5})/gi,
+    /(?:focus(?:ing)?\s+on|practic(?:e|ing))\s+([0-9]{1,2}(?:\s*(?:,|&|and)\s*[0-9]{1,2}){1,5})\s+facts?/gi
+  ];
+  labeled.forEach(function (re) {
+    while ((match = re.exec(source))) addList(match[1]);
+  });
+
+  return Array.from(found).sort(function (a, b) { return a - b; }).slice(0, 6);
+}
+
+/**
+ * Printable Math Masters packet matching math-masters-worksheet.html:
+ * navy header, session lines, 3-column grid, hero-check footer.
+ * Child practice sheets and parent answer keys are separate files.
+ */
+function generateMathMastersPacket_(missions, weekKey) {
+  if (!missions || !missions.length) throw new Error('No Math Masters missions to print.');
+  const sheetLabels = ['Practice 1 — early week', 'Practice 2 — mid week', 'Practice 3 — later week'];
+  const sheetCount = Math.min(SB.mathMastersSheetsPerWeek, sheetLabels.length);
+  const practicePages = [];
+  const answerPages = [];
+
+  missions.forEach(function (mission, missionIndex) {
+    for (let sheet = 0; sheet < sheetCount; sheet++) {
+      const seed = weekKey + '|' + mission.mode + '|' + mission.factors.join(',') +
+        '|m' + missionIndex + '|s' + sheet;
+      const problems = buildMathMastersProblems_(mission, seed, SB.mathMastersProblems);
+      const dayLabel = sheetLabels[sheet];
+      const subtitle = mission.training + (mission.factsLabel ? ': ' + mission.factsLabel : '');
+      practicePages.push({
+        title: mission.label,
+        subtitle: subtitle,
+        dayLabel: dayLabel,
+        weekKey: weekKey,
+        child: mission.child || 'Student',
+        problems: problems,
+        showAnswers: false
+      });
+      answerPages.push({
+        title: 'ANSWER KEY',
+        subtitle: mission.label + ' — ' + dayLabel,
+        dayLabel: dayLabel,
+        weekKey: weekKey,
+        child: 'Parent / caregiver',
+        problems: problems,
+        showAnswers: true
+      });
+    }
+  });
+
+  const slug = normalize_(missions.map(function (m) { return m.label; }).join('-'))
+    .replace(/\s+/g, '-').slice(0, 50) || 'math-masters';
+  const childSlug = normalize_(missions[0].child || 'student').replace(/\s+/g, '-') || 'student';
+  return {
+    practiceBlob: mathMastersDesignedPdfBlob_(
+      practicePages, childSlug + '-MathMasters-Practice-' + slug + '-' + weekKey + '.pdf'
+    ),
+    answerBlob: mathMastersDesignedPdfBlob_(
+      answerPages, childSlug + '-MathMasters-AnswerKey-' + slug + '-' + weekKey + '.pdf'
+    )
+  };
+}
+
+/** Colors / layout from Downloads/math-masters-worksheet.html */
+const MATH_MASTERS_DESIGN = Object.freeze({
+  navy: '#1b3158',
+  teal: '#317f83',
+  ink: '#26364e',
+  muted: '#657286',
+  line: '#aeb8c1'
+});
+
+function mathMastersDesignedPdfBlob_(pages, filename) {
+  const title = filename.replace(/\.pdf$/i, '');
+  const doc = DocumentApp.create(title);
+  const fileId = doc.getId();
+  try {
+    const body = doc.getBody();
+    body.setPageWidth(612).setPageHeight(792);
+    body.setMarginTop(28).setMarginBottom(28).setMarginLeft(36).setMarginRight(36);
+    pages.forEach(function (page, index) {
+      if (index) body.appendPageBreak();
+      appendMathMastersDesignedPage_(body, page);
+    });
+    if (body.getNumChildren() > 1) {
+      const first = body.getChild(0);
+      if (first.getType() === DocumentApp.ElementType.PARAGRAPH &&
+          !first.asParagraph().getText()) {
+        body.removeChild(first);
+      }
+    }
+    doc.saveAndClose();
+    const pdf = DriveApp.getFileById(fileId).getAs(MimeType.PDF);
+    if (pdf.getBytes().length < 500) throw new Error('The Math Masters PDF was empty.');
+    return pdf.setName(filename);
+  } finally {
+    try { DriveApp.getFileById(fileId).setTrashed(true); } catch (ignore) {}
+  }
+}
+
+function appendMathMastersDesignedPage_(body, page) {
+  const navy = MATH_MASTERS_DESIGN.navy;
+  const teal = MATH_MASTERS_DESIGN.teal;
+  const ink = MATH_MASTERS_DESIGN.ink;
+  const muted = MATH_MASTERS_DESIGN.muted;
+
+  const header = body.appendTable([['']]);
+  header.setBorderWidth(0);
+  const headerCell = header.getCell(0, 0);
+  headerCell.setBackgroundColor(navy);
+  headerCell.setPaddingTop(10).setPaddingBottom(10).setPaddingLeft(12).setPaddingRight(12);
+  headerCell.clear();
+  const titlePara = headerCell.appendParagraph(String(page.title || '').toUpperCase());
+  titlePara.setHeading(DocumentApp.ParagraphHeading.NORMAL);
+  titlePara.setForegroundColor('#ffffff').setBold(true).setFontSize(16)
+    .setFontFamily('Arial').setSpacingAfter(2);
+  const subtitlePara = headerCell.appendParagraph(String(page.subtitle || ''));
+  subtitlePara.setForegroundColor('#e2e8f0').setBold(false).setFontSize(10)
+    .setFontFamily('Arial').setSpacingAfter(0);
+  if (headerCell.getNumChildren() > 1) {
+    const empty = headerCell.getChild(0);
+    if (empty.getType() === DocumentApp.ElementType.PARAGRAPH &&
+        !empty.asParagraph().getText()) {
+      headerCell.removeChild(empty);
+    }
+  }
+
+  const day = body.appendParagraph(
+    String(page.dayLabel || '') + '  ·  Randomized for week ' + String(page.weekKey || '')
+  );
+  day.setForegroundColor(muted).setFontSize(9).setFontFamily('Arial')
+    .setSpacingBefore(10).setSpacingAfter(4);
+
+  const mission = body.appendParagraph('');
+  mission.setFontFamily('Arial').setFontSize(11).setForegroundColor(ink)
+    .setSpacingBefore(4).setSpacingAfter(8);
+  mission.appendText('MISSION: ').setBold(true).setForegroundColor(navy);
+  mission.appendText('Solve every problem. Accuracy first, then beat your own time!')
+    .setBold(false).setForegroundColor(ink);
+
+  if (!page.showAnswers) {
+    const session = body.appendTable([[
+      'Start time: __________',
+      'Finish time: __________',
+      'Correct: ______ / ' + (page.problems || []).length
+    ]]);
+    session.setBorderWidth(0);
+    for (let c = 0; c < 3; c++) {
+      const cell = session.getCell(0, c);
+      cell.setPaddingTop(2).setPaddingBottom(8).setPaddingLeft(0).setPaddingRight(8);
+      const p = cell.getChild(0).asParagraph();
+      p.setFontFamily('Arial').setFontSize(10).setForegroundColor(ink);
+    }
+  }
+
+  const problems = page.problems || [];
+  const gridRows = [];
+  for (let i = 0; i < problems.length; i += 3) {
+    gridRows.push([0, 1, 2].map(function (offset) {
+      const problem = problems[i + offset];
+      if (!problem) return '';
+      if (page.showAnswers) {
+        return problem.prompt + ' ' + problem.answer;
+      }
+      return problem.prompt + '   ______';
+    }));
+  }
+  if (gridRows.length) {
+    const grid = body.appendTable(gridRows);
+    grid.setBorderWidth(0);
+    const cols = 3;
+    const cellWidth = Math.floor(520 / cols);
+    for (let r = 0; r < grid.getNumRows(); r++) {
+      for (let c = 0; c < cols; c++) {
+        const cell = grid.getRow(r).getCell(c);
+        cell.setWidth(cellWidth);
+        cell.setPaddingTop(3).setPaddingBottom(3).setPaddingLeft(2).setPaddingRight(6);
+        for (let p = 0; p < cell.getNumChildren(); p++) {
+          const child = cell.getChild(p);
+          if (child.getType() === DocumentApp.ElementType.PARAGRAPH) {
+            child.asParagraph().setFontFamily('Arial').setFontSize(12)
+              .setForegroundColor(ink).setBold(false);
+          }
+        }
+      }
+    }
+  }
+
+  const hero = body.appendParagraph('');
+  hero.setSpacingBefore(14).setSpacingAfter(2).setFontFamily('Arial').setFontSize(11);
+  hero.appendText('HERO CHECK: Circle one:  ').setBold(true).setForegroundColor(teal);
+  hero.appendText('○ Training    ○ Ready    ○ Mastered').setBold(false).setForegroundColor(ink);
+
+  const target = body.appendParagraph(
+    page.showAnswers
+      ? 'Parent key for this practice sheet.'
+      : 'Target: 90% correct. Use a different practice sheet another day this week.'
+  );
+  target.setFontFamily('Arial').setFontSize(10).setForegroundColor(ink)
+    .setSpacingBefore(2).setSpacingAfter(8);
+
+  const divider = body.appendTable([['']]);
+  divider.setBorderWidth(0);
+  const dividerCell = divider.getCell(0, 0);
+  dividerCell.setBackgroundColor(teal);
+  dividerCell.setPaddingTop(0).setPaddingBottom(0);
+  dividerCell.clear();
+  const dividerLine = dividerCell.appendParagraph('');
+  dividerLine.setFontSize(1).setSpacingBefore(0).setSpacingAfter(0);
+  if (dividerCell.getNumChildren() > 1) {
+    const emptyDiv = dividerCell.getChild(0);
+    if (emptyDiv.getType() === DocumentApp.ElementType.PARAGRAPH) {
+      dividerCell.removeChild(emptyDiv);
+    }
+  }
+
+  const footer = body.appendTable([[
+    'Hero name: ____________________',
+    'Date: __________',
+    'Score: ______'
+  ]]);
+  footer.setBorderWidth(0);
+  for (let c = 0; c < 3; c++) {
+    const cell = footer.getCell(0, c);
+    cell.setPaddingTop(8).setPaddingBottom(2).setPaddingLeft(0).setPaddingRight(8);
+    cell.getChild(0).asParagraph().setFontFamily('Arial').setFontSize(10)
+      .setForegroundColor(ink);
+  }
+}
+
+function buildMathMastersProblems_(mission, seed, count) {
+  const pool = [];
+  // Factors must come from the email parse — never invent a default family.
+  const factors = (mission.factors && mission.factors.length) ? mission.factors.slice() : [];
+  if (!factors.length) return [];
+  const others = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+  const mode = mission.mode || 'mul';
+
+  factors.forEach(function (a) {
+    others.forEach(function (b) {
+      if (mode === 'mul' || mode === 'mixed') {
+        pool.push({prompt: a + ' × ' + b + ' =', answer: String(a * b)});
+        if (a !== b) pool.push({prompt: b + ' × ' + a + ' =', answer: String(a * b)});
+      }
+      if ((mode === 'div' || mode === 'mixed') && a > 0) {
+        const product = a * b;
+        pool.push({prompt: product + ' ÷ ' + a + ' =', answer: String(b)});
+      }
+    });
+  });
+
+  const shuffled = seededShuffle_(pool, seed);
+  const picked = [];
+  const seen = new Set();
+  for (let i = 0; i < shuffled.length && picked.length < count; i++) {
+    const item = shuffled[i];
+    if (seen.has(item.prompt)) continue;
+    seen.add(item.prompt);
+    picked.push(item);
+  }
+  while (picked.length < count && pool.length) {
+    const item = pool[picked.length % pool.length];
+    picked.push(item);
+  }
+  return picked;
+}
+
+/**
+ * Builds Tue/Wed/Thu Vocabulary Quest worksheets from a fixed template.
  * Definitions come from a small kid-friendly map, then Free Dictionary API,
- * then a plain fallback. No LLM call. Advanced feature.
+ * then a plain fallback. No LLM call.
+ */
+/** Colors / layout from Downloads/vocabulary-quest-template.html */
+const VOCAB_QUEST_DESIGN = Object.freeze({
+  teal: '#1e7f89',
+  navy: '#20384d',
+  ink: '#344656',
+  muted: '#667582',
+  line: '#cbd2d7'
+});
+
+/**
+ * Vocabulary Quest packet: child practice PDF + separate parent answer key.
+ * Visual chrome matches vocabulary-quest-template.html (teal header, copy lines).
  */
 function generateVocabPacket_(list, weekKey) {
   const words = list.words.slice();
@@ -1429,14 +2019,6 @@ function generateVocabPacket_(list, weekKey) {
       missing: missingLetters_(word, seed + ':missing:' + index)
     };
   });
-  const html = buildVocabPacketHtml_(list.child, entries, seed);
-  const slug = normalize_(list.title).replace(/\s+/g, '-').slice(0, 40) || 'vocabulary';
-  const filename = list.child + '-' + slug + '-' + weekKey + '.pdf';
-  return {blob: htmlToPdfBlob_(html, filename)};
-}
-
-function buildVocabPacketHtml_(child, entries, seed) {
-  const words = entries.map(function (entry) { return entry.word; });
   const matchOrder = seededShuffle_(entries.slice(), seed + ':match');
   const matchLetters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
   const starters = sentenceStarters_(words, seed);
@@ -1445,160 +2027,361 @@ function buildVocabPacketHtml_(child, entries, seed) {
   const abcOrder = words.slice().sort(function (a, b) {
     return a.toLowerCase().localeCompare(b.toLowerCase());
   });
+  const child = list.child || 'Student';
+  const practicePages = buildVocabQuestPracticePages_({
+    child: child, entries: entries, matchOrder: matchOrder, matchLetters: matchLetters,
+    starters: starters, chooseItems: chooseItems, fillItems: fillItems, words: words
+  });
+  const answerPages = buildVocabQuestAnswerPages_({
+    child: child, entries: entries, matchOrder: matchOrder, matchLetters: matchLetters,
+    chooseItems: chooseItems, fillItems: fillItems, abcOrder: abcOrder, words: words
+  });
+  const slug = normalize_(list.title).replace(/\s+/g, '-').slice(0, 40) || 'vocabulary';
+  return {
+    practiceBlob: vocabQuestPdfBlob_(
+      practicePages, child + '-VocabQuest-Practice-' + slug + '-' + weekKey + '.pdf'
+    ),
+    answerBlob: vocabQuestPdfBlob_(
+      answerPages, child + '-VocabQuest-AnswerKey-' + slug + '-' + weekKey + '.pdf'
+    )
+  };
+}
 
-  const pages = [];
-  pages.push(packetPage_([
-    '<h1>Tuesday — Learn the words</h1>',
-    nameDateLine_(child),
-    '<h2>Look, Cover, Write, Check</h2>',
-    '<p>Look at the word. Cover it. Write it. Check it. You can do this!</p>',
-    tableHtml_([['Word', 'Cover &amp; write', 'Check ✓']].concat(
-      entries.map(function (entry) {
-        return [escapeHtml_(entry.word), '______________', '______________'];
-      })
-    ))
-  ].join('')));
+function buildVocabQuestPracticePages_(model) {
+  const total = 5;
+  return [
+    {
+      kicker: 'VOCABULARY QUEST / MONDAY — 1 OF ' + total,
+      title: 'Meet Your Word Team',
+      instructions: 'Read each word and meaning aloud. Circle a tricky letter group, then copy the word.',
+      kind: 'meet',
+      pageNumber: 1,
+      total: total,
+      model: model
+    },
+    {
+      kicker: 'VOCABULARY QUEST / TUESDAY — 2 OF ' + total,
+      title: 'Match & Sentence Starters',
+      instructions: 'Write the letter of the meaning next to each word. Then finish each sentence starter.',
+      kind: 'match',
+      pageNumber: 2,
+      total: total,
+      model: model
+    },
+    {
+      kicker: 'VOCABULARY QUEST / WEDNESDAY — 3 OF ' + total,
+      title: 'Scramble & Missing Letters',
+      instructions: 'Unscramble each word, then fill in the missing letters.',
+      kind: 'scramble',
+      pageNumber: 3,
+      total: total,
+      model: model
+    },
+    {
+      kicker: 'VOCABULARY QUEST / WEDNESDAY — 4 OF ' + total,
+      title: 'Choose the Right Word',
+      instructions: 'Circle or write the word that fits best. Then write one sentence of your own.',
+      kind: 'choose',
+      pageNumber: 4,
+      total: total,
+      model: model
+    },
+    {
+      kicker: 'VOCABULARY QUEST / THURSDAY — 5 OF ' + total,
+      title: 'Remember & Celebrate',
+      instructions: 'Put the words in ABC order, fill in the blanks, then celebrate a favorite word.',
+      kind: 'thursday',
+      pageNumber: 5,
+      total: total,
+      model: model
+    }
+  ];
+}
 
-  pages.push(packetPage_([
-    '<h1>Tuesday — Matching game</h1>',
-    nameDateLine_(child),
-    '<h2>Match the word to its meaning</h2>',
-    '<p>Write the letter of the meaning next to each word.</p>',
-    tableHtml_([['#', 'Word', 'Letter']].concat(
-      entries.map(function (entry, index) {
-        return [String(index + 1), escapeHtml_(entry.word), '____'];
-      })
-    )),
-    '<h2>Meanings</h2>',
-    '<ol>' + matchOrder.map(function (entry, index) {
-      return '<li><strong>' + matchLetters.charAt(index) + '.</strong> ' +
-        escapeHtml_(entry.definition) + '</li>';
-    }).join('') + '</ol>',
-    '<h2>Sentence starters</h2>',
-    '<p>Finish each sentence with your own idea.</p>',
-    starters.map(function (starter) {
-      return '<p>' + escapeHtml_(starter) + '</p><p>________________________________</p>';
-    }).join('')
-  ].join('')));
+function buildVocabQuestAnswerPages_(model) {
+  return [{
+    kicker: 'VOCABULARY QUEST / ANSWER KEY',
+    title: 'Parent / Caregiver Key',
+    instructions: 'Use this key with the child practice sheets. Keep it separate from the child packet.',
+    kind: 'answers',
+    pageNumber: 1,
+    total: 1,
+    model: model
+  }];
+}
 
-  pages.push(packetPage_([
-    '<h1>Wednesday — Practice the words</h1>',
-    nameDateLine_(child),
-    '<h2>Word scramble</h2>',
-    '<p>Unscramble each word. The letters are already there — put them in order!</p>',
-    tableHtml_([['Scramble', 'Write the word']].concat(
-      entries.map(function (entry) {
-        return [escapeHtml_(entry.scramble), '______________'];
-      })
-    )),
-    '<h2>Missing letters</h2>',
-    '<p>Fill in the blanks to finish each word.</p>',
-    tableHtml_([['Puzzle', 'Word']].concat(
-      entries.map(function (entry) {
-        return [escapeHtml_(entry.missing), '______________'];
-      })
-    ))
-  ].join('')));
+function vocabQuestPdfBlob_(pages, filename) {
+  const title = filename.replace(/\.pdf$/i, '');
+  const doc = DocumentApp.create(title);
+  const fileId = doc.getId();
+  try {
+    const body = doc.getBody();
+    body.setPageWidth(612).setPageHeight(792);
+    body.setMarginTop(28).setMarginBottom(28).setMarginLeft(42).setMarginRight(42);
+    pages.forEach(function (page, index) {
+      if (index) body.appendPageBreak();
+      appendVocabQuestPage_(body, page);
+    });
+    if (body.getNumChildren() > 1) {
+      const first = body.getChild(0);
+      if (first.getType() === DocumentApp.ElementType.PARAGRAPH &&
+          !first.asParagraph().getText()) {
+        body.removeChild(first);
+      }
+    }
+    doc.saveAndClose();
+    const pdf = DriveApp.getFileById(fileId).getAs(MimeType.PDF);
+    if (pdf.getBytes().length < 500) throw new Error('The vocabulary PDF was empty.');
+    return pdf.setName(filename);
+  } finally {
+    try { DriveApp.getFileById(fileId).setTrashed(true); } catch (ignore) {}
+  }
+}
 
-  pages.push(packetPage_([
-    '<h1>Wednesday — Choose and write</h1>',
-    nameDateLine_(child),
-    '<h2>Choose the right word</h2>',
-    '<p>Circle or write the word that fits best.</p>',
-    chooseItems.map(function (item, index) {
-      return '<p>' + (index + 1) + '. ' + escapeHtml_(item.sentence) + '<br>Choices: ' +
-        escapeHtml_(item.choices.join(' / ')) + '</p><p>Answer: ______________</p>';
-    }).join(''),
-    '<h2>My own sentence</h2>',
-    '<p>Pick one word from the list and write a sentence with 7 words or more.</p>',
-    '<p>Word I picked: ______________</p>',
-    '<p>________________________________</p>',
-    '<p>________________________________</p>'
-  ].join('')));
+function appendVocabQuestPage_(body, page) {
+  const teal = VOCAB_QUEST_DESIGN.teal;
+  const navy = VOCAB_QUEST_DESIGN.navy;
+  const ink = VOCAB_QUEST_DESIGN.ink;
+  const model = page.model;
 
-  pages.push(packetPage_([
-    '<h1>Thursday — Remember and apply</h1>',
-    nameDateLine_(child),
-    '<h2>ABC spelling challenge</h2>',
-    '<p>Write the words in alphabetical order. Then check your spelling.</p>',
-    tableHtml_([['#', 'Word in ABC order']].concat(
-      words.map(function (_, index) {
-        return [String(index + 1), '______________'];
-      })
-    )),
-    '<h2>Quick review</h2>',
-    '<p>Cover the list. How many words can you spell from memory?</p>',
-    '<p>________________________________</p>',
-    '<p>________________________________</p>',
-    '<p>________________________________</p>'
-  ].join('')));
+  const header = body.appendTable([['']]);
+  header.setBorderWidth(0);
+  const headerCell = header.getCell(0, 0);
+  headerCell.setBackgroundColor(teal);
+  headerCell.setPaddingTop(12).setPaddingBottom(12).setPaddingLeft(14).setPaddingRight(14);
+  headerCell.clear();
+  const kicker = headerCell.appendParagraph(String(page.kicker || ''));
+  kicker.setForegroundColor('#f1ffff').setBold(true).setFontSize(10)
+    .setFontFamily('Arial').setSpacingAfter(6);
+  const title = headerCell.appendParagraph(String(page.title || ''));
+  title.setForegroundColor('#ffffff').setBold(true).setFontSize(18)
+    .setFontFamily('Arial').setSpacingAfter(0);
+  if (headerCell.getNumChildren() > 1) {
+    const empty = headerCell.getChild(0);
+    if (empty.getType() === DocumentApp.ElementType.PARAGRAPH &&
+        !empty.asParagraph().getText()) {
+      headerCell.removeChild(empty);
+    }
+  }
 
-  pages.push(packetPage_([
-    '<h1>Thursday — Meanings and celebration</h1>',
-    nameDateLine_(child),
-    '<h2>Fill in the blank</h2>',
-    '<p>Use a vocabulary word that matches the meaning.</p>',
-    fillItems.map(function (item, index) {
-      return '<p>' + (index + 1) + '. ' + escapeHtml_(item.sentence) + '</p>' +
-        '<p>Word bank hint: ' + escapeHtml_(item.bank.join(', ')) + '</p>' +
-        '<p>Answer: ______________</p>';
-    }).join(''),
-    '<h2>Write two sentences</h2>',
-    '<p>Use two different words from the list. Make each sentence 7 words or longer.</p>',
-    '<p>1. ________________________________</p>',
-    '<p>________________________________</p>',
-    '<p>2. ________________________________</p>',
-    '<p>________________________________</p>',
-    '<h2>Word champion!</h2>',
-    '<p>Circle your favorite word from the list and write one reason you like it.</p>',
-    '<p>Favorite word: ______________</p>',
-    '<p>Because: ________________________________</p>',
-    '<p>Great work this week — you practiced like a champion!</p>'
-  ].join('')));
+  const details = body.appendTable([[
+    'Name: ' + (model.child || '______________') + ' ____________________',
+    'Date: __________'
+  ]]);
+  details.setBorderWidth(0);
+  for (let c = 0; c < 2; c++) {
+    const cell = details.getCell(0, c);
+    cell.setPaddingTop(12).setPaddingBottom(8).setPaddingLeft(0).setPaddingRight(10);
+    cell.getChild(0).asParagraph().setFontFamily('Arial').setFontSize(11)
+      .setForegroundColor(ink);
+  }
 
-  const matchAnswers = entries.map(function (entry, index) {
+  const instructions = body.appendParagraph(String(page.instructions || ''));
+  instructions.setFontFamily('Arial').setFontSize(11).setForegroundColor(ink)
+    .setSpacingBefore(2).setSpacingAfter(10);
+
+  if (page.kind === 'meet') appendVocabMeetContent_(body, model);
+  else if (page.kind === 'match') appendVocabMatchContent_(body, model);
+  else if (page.kind === 'scramble') appendVocabScrambleContent_(body, model);
+  else if (page.kind === 'choose') appendVocabChooseContent_(body, model);
+  else if (page.kind === 'thursday') appendVocabThursdayContent_(body, model);
+  else if (page.kind === 'answers') appendVocabAnswerContent_(body, model);
+
+  const footer = body.appendTable([[
+    'MON > TUE > WED > THU > FRIDAY READY!',
+    String(page.pageNumber || 1)
+  ]]);
+  footer.setBorderWidth(0);
+  footer.getCell(0, 0).setPaddingTop(16).setPaddingBottom(0).setPaddingLeft(0);
+  footer.getCell(0, 0).getChild(0).asParagraph().setFontFamily('Arial').setFontSize(9)
+    .setBold(true).setForegroundColor(navy);
+  footer.getCell(0, 1).setPaddingTop(16).setPaddingBottom(0).setPaddingRight(0);
+  footer.getCell(0, 1).getChild(0).asParagraph().setFontFamily('Arial').setFontSize(10)
+    .setForegroundColor(navy).setAlignment(DocumentApp.HorizontalAlignment.RIGHT);
+}
+
+function appendVocabMeetContent_(body, model) {
+  const navy = VOCAB_QUEST_DESIGN.navy;
+  const ink = VOCAB_QUEST_DESIGN.ink;
+  model.entries.forEach(function (entry) {
+    const row = body.appendTable([[entry.word, entry.definition]]);
+    row.setBorderWidth(0);
+    const wordCell = row.getCell(0, 0);
+    wordCell.setWidth(120);
+    wordCell.setPaddingTop(4).setPaddingBottom(0).setPaddingLeft(0).setPaddingRight(8);
+    wordCell.getChild(0).asParagraph().setFontFamily('Arial').setFontSize(12)
+      .setBold(true).setForegroundColor(navy);
+    row.getCell(0, 1).setPaddingTop(4).setPaddingBottom(0).setPaddingLeft(0);
+    row.getCell(0, 1).getChild(0).asParagraph().setFontFamily('Arial').setFontSize(10)
+      .setForegroundColor(ink);
+    const copy = body.appendParagraph('Copy: ________________________________');
+    copy.setFontFamily('Arial').setFontSize(10).setForegroundColor(ink)
+      .setSpacingBefore(2).setSpacingAfter(8);
+  });
+}
+
+function appendVocabMatchContent_(body, model) {
+  const ink = VOCAB_QUEST_DESIGN.ink;
+  const navy = VOCAB_QUEST_DESIGN.navy;
+  const heading = body.appendParagraph('Match the word to its meaning');
+  heading.setFontFamily('Arial').setFontSize(12).setBold(true).setForegroundColor(navy)
+    .setSpacingAfter(6);
+  const matchRows = [['#', 'Word', 'Letter']].concat(
+    model.entries.map(function (entry, index) {
+      return [String(index + 1), entry.word, '____'];
+    })
+  );
+  appendVocabSimpleTable_(body, matchRows);
+  const meanings = body.appendParagraph('Meanings');
+  meanings.setFontFamily('Arial').setFontSize(12).setBold(true).setForegroundColor(navy)
+    .setSpacingBefore(10).setSpacingAfter(4);
+  model.matchOrder.forEach(function (entry, index) {
+    const line = body.appendParagraph(
+      model.matchLetters.charAt(index) + '. ' + entry.definition
+    );
+    line.setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(2);
+  });
+  const startersHead = body.appendParagraph('Sentence starters');
+  startersHead.setFontFamily('Arial').setFontSize(12).setBold(true).setForegroundColor(navy)
+    .setSpacingBefore(10).setSpacingAfter(4);
+  model.starters.forEach(function (starter) {
+    body.appendParagraph(starter).setFontFamily('Arial').setFontSize(10)
+      .setForegroundColor(ink).setSpacingAfter(1);
+    body.appendParagraph('________________________________')
+      .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(6);
+  });
+}
+
+function appendVocabScrambleContent_(body, model) {
+  const navy = VOCAB_QUEST_DESIGN.navy;
+  body.appendParagraph('Word scramble').setFontFamily('Arial').setFontSize(12)
+    .setBold(true).setForegroundColor(navy).setSpacingAfter(6);
+  appendVocabSimpleTable_(body, [['Scramble', 'Write the word']].concat(
+    model.entries.map(function (entry) {
+      return [entry.scramble, '______________'];
+    })
+  ));
+  body.appendParagraph('Missing letters').setFontFamily('Arial').setFontSize(12)
+    .setBold(true).setForegroundColor(navy).setSpacingBefore(12).setSpacingAfter(6);
+  appendVocabSimpleTable_(body, [['Puzzle', 'Word']].concat(
+    model.entries.map(function (entry) {
+      return [entry.missing, '______________'];
+    })
+  ));
+}
+
+function appendVocabChooseContent_(body, model) {
+  const ink = VOCAB_QUEST_DESIGN.ink;
+  const navy = VOCAB_QUEST_DESIGN.navy;
+  model.chooseItems.forEach(function (item, index) {
+    body.appendParagraph((index + 1) + '. ' + item.sentence)
+      .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(2);
+    body.appendParagraph('Choices: ' + item.choices.join(' / '))
+      .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(1);
+    body.appendParagraph('Answer: ______________')
+      .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(8);
+  });
+  body.appendParagraph('My own sentence').setFontFamily('Arial').setFontSize(12)
+    .setBold(true).setForegroundColor(navy).setSpacingBefore(6).setSpacingAfter(4);
+  body.appendParagraph('Pick one word and write a sentence with 7 words or more.')
+    .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(4);
+  body.appendParagraph('Word I picked: ______________')
+    .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(4);
+  body.appendParagraph('________________________________')
+    .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(2);
+  body.appendParagraph('________________________________')
+    .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink);
+}
+
+function appendVocabThursdayContent_(body, model) {
+  const ink = VOCAB_QUEST_DESIGN.ink;
+  const navy = VOCAB_QUEST_DESIGN.navy;
+  body.appendParagraph('ABC spelling challenge').setFontFamily('Arial').setFontSize(12)
+    .setBold(true).setForegroundColor(navy).setSpacingAfter(6);
+  appendVocabSimpleTable_(body, [['#', 'Word in ABC order']].concat(
+    model.words.map(function (_, index) {
+      return [String(index + 1), '______________'];
+    })
+  ));
+  body.appendParagraph('Fill in the blank').setFontFamily('Arial').setFontSize(12)
+    .setBold(true).setForegroundColor(navy).setSpacingBefore(10).setSpacingAfter(4);
+  model.fillItems.forEach(function (item, index) {
+    body.appendParagraph((index + 1) + '. ' + item.sentence)
+      .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(1);
+    body.appendParagraph('Word bank: ' + item.bank.join(', '))
+      .setFontFamily('Arial').setFontSize(9).setForegroundColor(ink).setSpacingAfter(1);
+    body.appendParagraph('Answer: ______________')
+      .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(6);
+  });
+  body.appendParagraph('Word champion!').setFontFamily('Arial').setFontSize(12)
+    .setBold(true).setForegroundColor(navy).setSpacingBefore(6).setSpacingAfter(4);
+  body.appendParagraph('Favorite word: ______________  Because: ____________________')
+    .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink);
+}
+
+function appendVocabAnswerContent_(body, model) {
+  const ink = VOCAB_QUEST_DESIGN.ink;
+  const navy = VOCAB_QUEST_DESIGN.navy;
+  body.appendParagraph('Word list: ' + model.words.join(', '))
+    .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(8);
+  body.appendParagraph('Tuesday matching').setFontFamily('Arial').setFontSize(12)
+    .setBold(true).setForegroundColor(navy).setSpacingAfter(4);
+  model.entries.forEach(function (entry, index) {
     let letterIndex = 0;
-    for (let i = 0; i < matchOrder.length; i++) {
-      if (matchOrder[i].word === entry.word) {
+    for (let i = 0; i < model.matchOrder.length; i++) {
+      if (model.matchOrder[i].word === entry.word) {
         letterIndex = i;
         break;
       }
     }
-    const letter = matchLetters.charAt(letterIndex);
-    return (index + 1) + '. ' + entry.word + ' → ' + letter + ' (' + entry.definition + ')';
+    body.appendParagraph(
+      (index + 1) + '. ' + entry.word + ' → ' + model.matchLetters.charAt(letterIndex) +
+        ' (' + entry.definition + ')'
+    ).setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(2);
   });
-  pages.push(packetPage_([
-    '<h1>Answer key — Parent / caregiver</h1>',
-    '<p>Word list: ' + escapeHtml_(words.join(', ')) + '</p>',
-    '<h2>Tuesday matching</h2>',
-    '<ol>' + matchAnswers.map(function (line) {
-      return '<li>' + escapeHtml_(line) + '</li>';
-    }).join('') + '</ol>',
-    '<h2>Wednesday scrambles</h2>',
-    '<ol>' + entries.map(function (entry) {
-      return '<li>' + escapeHtml_(entry.scramble) + ' → ' + escapeHtml_(entry.word) + '</li>';
-    }).join('') + '</ol>',
-    '<h2>Wednesday missing letters</h2>',
-    '<ol>' + entries.map(function (entry) {
-      return '<li>' + escapeHtml_(entry.missing) + ' → ' + escapeHtml_(entry.word) + '</li>';
-    }).join('') + '</ol>',
-    '<h2>Wednesday choose-the-word</h2>',
-    '<ol>' + chooseItems.map(function (item) {
-      return '<li>' + escapeHtml_(item.answer) + '</li>';
-    }).join('') + '</ol>',
-    '<h2>Thursday ABC order</h2>',
-    '<p>' + escapeHtml_(abcOrder.join(', ')) + '</p>',
-    '<h2>Thursday fill-in-the-blank</h2>',
-    '<ol>' + fillItems.map(function (item) {
-      return '<li>' + escapeHtml_(item.answer) + '</li>';
-    }).join('') + '</ol>',
-    '<h2>Example sentences</h2>',
-    '<ol>' + words.slice(0, Math.min(4, words.length)).map(function (word) {
-      return '<li>' + escapeHtml_(exampleSentence_(word)) + '</li>';
-    }).join('') + '</ol>'
-  ].join('')));
+  body.appendParagraph('Wednesday scrambles').setFontFamily('Arial').setFontSize(12)
+    .setBold(true).setForegroundColor(navy).setSpacingBefore(8).setSpacingAfter(4);
+  model.entries.forEach(function (entry) {
+    body.appendParagraph(entry.scramble + ' → ' + entry.word)
+      .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(2);
+  });
+  body.appendParagraph('Wednesday missing letters').setFontFamily('Arial').setFontSize(12)
+    .setBold(true).setForegroundColor(navy).setSpacingBefore(8).setSpacingAfter(4);
+  model.entries.forEach(function (entry) {
+    body.appendParagraph(entry.missing + ' → ' + entry.word)
+      .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(2);
+  });
+  body.appendParagraph('Wednesday choose-the-word').setFontFamily('Arial').setFontSize(12)
+    .setBold(true).setForegroundColor(navy).setSpacingBefore(8).setSpacingAfter(4);
+  model.chooseItems.forEach(function (item, index) {
+    body.appendParagraph((index + 1) + '. ' + item.answer)
+      .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(2);
+  });
+  body.appendParagraph('Thursday ABC order').setFontFamily('Arial').setFontSize(12)
+    .setBold(true).setForegroundColor(navy).setSpacingBefore(8).setSpacingAfter(4);
+  body.appendParagraph(model.abcOrder.join(', '))
+    .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(6);
+  body.appendParagraph('Thursday fill-in-the-blank').setFontFamily('Arial').setFontSize(12)
+    .setBold(true).setForegroundColor(navy).setSpacingAfter(4);
+  model.fillItems.forEach(function (item, index) {
+    body.appendParagraph((index + 1) + '. ' + item.answer)
+      .setFontFamily('Arial').setFontSize(10).setForegroundColor(ink).setSpacingAfter(2);
+  });
+}
 
-  return '<!DOCTYPE html><html><body>' + pages.join('') + '</body></html>';
+function appendVocabSimpleTable_(body, rows) {
+  const ink = VOCAB_QUEST_DESIGN.ink;
+  const table = body.appendTable(rows);
+  table.setBorderWidth(0.5);
+  for (let r = 0; r < table.getNumRows(); r++) {
+    for (let c = 0; c < table.getRow(r).getNumCells(); c++) {
+      const cell = table.getRow(r).getCell(c);
+      cell.setPaddingTop(4).setPaddingBottom(4).setPaddingLeft(6).setPaddingRight(6);
+      const para = cell.getChild(0).asParagraph();
+      para.setFontFamily('Arial').setFontSize(r === 0 ? 10 : 11).setForegroundColor(ink);
+      if (r === 0) para.setBold(true);
+    }
+  }
 }
 
 function packetPage_(innerHtml) {
@@ -2144,7 +2927,7 @@ function extractAssignments_(message, apiKey, teacher) {
     'Family: ' + roster,
     senderHint,
     'Return one item for each distinct homework deadline, quiz, test, vocabulary',
-    'test, spelling test, project, field trip, or important school date.',
+    'test, spelling test, project, field trip, Math Masters / math facts, or important school date.',
     'Use dueDate as YYYY-MM-DD in ' + family.timezone + ', or empty string if unknown.',
     'Resolve unambiguous relative dates against the email sent date.',
     'Never invent a date or an assignment. Child must be ' + childChoices + '.',
@@ -2160,6 +2943,9 @@ function extractAssignments_(message, apiKey, teacher) {
     'changes, forms, payments, reminders, or parent actions.',
     'Do not repeat a simple assignment deadline as a notice unless the message',
     'contains extra logistics not already in the assignment instructions.',
+    'Do not create a notice whose only parentAction is to check another school',
+    'or office email for important dates. Those dates are extracted when that',
+    'office email is scanned. Leave parentAction empty for awareness-only notes.',
     'For notices provide child, category, headline, details, parentAction,',
     'relevantDate (YYYY-MM-DD or blank), confidence and evidence.',
     'Do not infer a date or make up an action. If none, return notices: [].',
@@ -2249,9 +3035,7 @@ function configuration_() {
 }
 
 function isSchoolSender_(sender) {
-  const domain = cfg_().schoolDomain;
-  if (!domain) return false;
-  return String(sender || '').toLowerCase().endsWith('@' + domain);
+  return String(sender || '').toLowerCase().endsWith('@' + cfg_().schoolDomain);
 }
 
 function childForSender_(sender, extracted) {
