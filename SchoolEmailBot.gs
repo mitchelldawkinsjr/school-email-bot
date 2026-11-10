@@ -1,48 +1,26 @@
 /**
- * School Email Bot — Dawkins family.
- * Review-first: Gmail label LSA -> Gemini -> family Google Calendar.
- * Bind this code to a Google Sheet.
+ * School Email Bot
+ * Review-first: school Gmail label -> Gemini -> family Google Calendar.
+ * Bind this code to a Google Sheet. Family/school details live on the Config
+ * and Teachers sheets (not in this file).
  *
- * Gmail already filters @livingstonesgr.org onto the label "LSA"
- * (Never send it to Spam, Categorize as Primary). This script only reads
- * that label, and only addresses at livingstonesgr.org.
+ * Simple setup: fill Config, set GEMINI_API_KEY in Script Properties, install
+ * triggers. Dated assignments auto-publish unless they look like a duplicate
+ * or update. A Sunday briefing covers the coming school week.
  *
- * Known teachers are pinned to a child. Other school senders are still
- * reviewed, but the child is kept only when the email names Mitch, Malik,
- * or Micah.
- *
- * Every extracted item is written to the Review sheet for an audit trail.
- * A new item with a due date is marked Approved and published on that run,
- * unless it duplicates or updates a row already on the sheet. Those stay
- * Possible duplicate or Possible update for a person to accept.
- * A due date before today is Skipped. Needs date stays on the sheet.
- * Each publish sends one Gmail notice to the parents. The phone push is
- * Gmail's notification for that mail, plus the calendar popup reminders.
- * A Sunday ~9 AM briefing covers the coming school week only: confirmed
- * deadlines, open parent actions dated this week or later, class notes from
- * this week, and future sheet decisions. Past backlog stays on the sheet.
- * The HTML email follows the Living Stones weekly note design (green header,
- * short summary, gold attention card, calendar list). Gold card prefers real
- * parent actions; sheet exceptions are only Needs date / Possible duplicate /
- * Possible update. Dated items still auto-publish. Briefing emails keep the
- * full instructions and an Open email link back to the source thread.
- * When Mitch has a vocabulary or spelling list due that week, the briefing
- * builds a printable worksheet packet from a fixed template (no LLM) and
- * attaches it as a PDF. The answer key is the last page. The PDF is built
- * with DocumentApp and exported by DriveApp, so the Cloud Drive API stays off.
- * The account that runs this script needs "Make changes to events"
- * on dawkinsbreanna@gmail.com. The private iCal feed cannot create events.
+ * Advanced (Config flags + Teachers sheet): pin teachers to children, optional
+ * vocabulary PDF packets, optional Math Masters practice PDFs. Packets use
+ * DocumentApp/DriveApp only (no Cloud Drive API).
  */
 
 const SB = Object.freeze({
-  timezone: 'America/Detroit',
-  gmailLabel: 'LSA',
-  schoolDomain: 'livingstonesgr.org',
   reviewSheet: 'Review',
   processedSheet: 'Processed',
   briefingSheet: 'BriefingNotes',
   briefingProcessedSheet: 'BriefingProcessed',
   previewSheet: 'WeeklyPreview',
+  configSheet: 'Config',
+  teachersSheet: 'Teachers',
   model: 'gemini-2.5-flash',
   maxThreads: 150,
   maxMessagesPerScan: 15,
@@ -51,35 +29,33 @@ const SB = Object.freeze({
   maxImageBytes: 4 * 1024 * 1024,
 });
 
-const FAMILY_CALENDAR_ID = 'dawkinsbreanna@gmail.com';
-const DEFAULT_NOTIFY = 'mitchell.dawkinsjr@gmail.com,dawkinsbreanna@gmail.com';
+const CONFIG_HEADERS = ['Key', 'Value', 'Notes'];
+const TEACHER_HEADERS = ['Teacher Email', 'Child', 'Grade'];
 
-const CHILDREN = Object.freeze(['Mitch', 'Malik', 'Micah']);
-
-const TEACHERS = Object.freeze({
-  'davidw@livingstonesgr.org': { child: 'Mitch', grade: '4th grade' },
-  'kathyw@livingstonesgr.org': { child: 'Malik', grade: 'Pre-K' },
-  'ellam@livingstonesgr.org': { child: 'Micah', grade: 'Kindergarten' },
-});
-
-const REVIEW_HEADERS = [
-  'Status', 'Child', 'Type', 'Assignment / Event', 'Due Date (YYYY-MM-DD)',
-  'Due Time (if given)', 'Instructions', 'Teacher Email', 'Email Subject',
-  'Original Email', 'Message ID', 'Calendar Event ID', 'Confidence',
-  'Evidence from Email', 'Candidate ID', 'Created At', 'Error'
+const CONFIG_DEFAULTS = [
+  ['timezone', 'America/Detroit', 'Must match Apps Script project timezone'],
+  ['gmail_label', 'School', 'Gmail label that holds school mail'],
+  ['school_domain', 'yourschool.org', 'Only read senders at this domain'],
+  ['school_name', 'Your School', 'Briefing header'],
+  ['school_short_name', 'School', 'Short name in briefing sections'],
+  ['school_initials', 'YS', 'Two letters in the briefing badge'],
+  ['family_name', 'Your family', 'Greeting line'],
+  ['children', 'Alex, Jordan', 'Comma-separated child names'],
+  ['family_calendar_id', '', 'Calendar ID / email the bot can edit'],
+  ['notify_emails', '', 'Comma-separated parent emails for notices + briefing'],
+  ['briefing_hour', '9', 'Sunday briefing hour (0-23), local project timezone'],
+  ['advanced_vocab_packets', 'FALSE', 'TRUE to attach vocab/spelling PDFs'],
+  ['advanced_math_masters', 'FALSE', 'TRUE to attach Math Masters practice PDFs'],
+  ['vocab_children', '', 'Children who get vocab packets (blank = all children)'],
+  ['math_masters_children', '', 'Children who get Math Masters packets (blank = all)']
 ];
 
-const BRIEFING_HEADERS = [
-  'Child', 'Category', 'Headline', 'Details', 'Parent Action',
-  'Relevant Date (YYYY-MM-DD)', 'Teacher Email', 'Email Subject',
-  'Original Email', 'Message ID', 'Received At', 'Confidence',
-  'Evidence from Email', 'Note ID', 'Action Status (Open/Done)'
-];
+var CONFIG_CACHE_ = null;
 
 function onOpen() {
-  SpreadsheetApp.getUi()
-    .createMenu('School Bot')
-    .addItem('1. Initialize review sheets', 'initializeSchoolBot')
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('School Bot')
+    .addItem('1. Initialize sheets + Config', 'initializeSchoolBot')
     .addItem('2. Scan and publish new items', 'scanSchoolEmails')
     .addItem('3. Publish approved rows', 'publishApprovedRows')
     .addItem('4. Install 30-minute schedule', 'installSchoolBotTrigger')
@@ -87,11 +63,19 @@ function onOpen() {
     .addItem('5. Preview weekly briefing', 'previewWeeklyBriefing')
     .addItem('6. Send weekly briefing now', 'resendWeeklyBriefing')
     .addItem('7. Install Sunday briefing schedule', 'installWeeklyBriefingTrigger')
+    .addSeparator()
+    .addSubMenu(ui.createMenu('Advanced')
+      .addItem('Open Config sheet', 'showConfigSheet')
+      .addItem('Open Teachers sheet', 'showTeachersSheet')
+      .addItem('Reload config cache', 'reloadFamilyConfig'))
     .addToUi();
 }
 
 function initializeSchoolBot() {
+  CONFIG_CACHE_ = null;
   const book = SpreadsheetApp.getActiveSpreadsheet();
+  ensureConfigSheet_(book);
+  ensureTeachersSheet_(book);
   ensureSheet_(book, SB.reviewSheet, REVIEW_HEADERS);
   ensureSheet_(book, SB.processedSheet, ['Message ID', 'Processed At', 'Subject']);
   ensureSheet_(book, SB.briefingSheet, BRIEFING_HEADERS);
@@ -107,7 +91,28 @@ function initializeSchoolBot() {
     .requireValueInList(statuses, true).setAllowInvalid(false).build();
   review.getRange(2, 1, Math.max(review.getMaxRows() - 1, 1), 1)
     .setDataValidation(rule);
-  SpreadsheetApp.getActive().toast('Review sheets are ready. Set GEMINI_API_KEY in Script Properties.');
+  SpreadsheetApp.getActive().toast(
+    'Sheets ready. Fill Config + Teachers, then set GEMINI_API_KEY in Script Properties.');
+}
+
+function showConfigSheet() {
+  ensureConfigSheet_(SpreadsheetApp.getActiveSpreadsheet());
+  SpreadsheetApp.getActiveSpreadsheet().setActiveSheet(
+    SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SB.configSheet));
+}
+
+function showTeachersSheet() {
+  ensureTeachersSheet_(SpreadsheetApp.getActiveSpreadsheet());
+  SpreadsheetApp.getActiveSpreadsheet().setActiveSheet(
+    SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SB.teachersSheet));
+}
+
+function reloadFamilyConfig() {
+  CONFIG_CACHE_ = null;
+  const cfg = cfg_();
+  SpreadsheetApp.getActive().toast(
+    'Config loaded: ' + cfg.schoolName + ' · ' +
+    (cfg.children.join(', ') || 'no children'));
 }
 
 function installSchoolBotTrigger() {
@@ -119,15 +124,161 @@ function installSchoolBotTrigger() {
 }
 
 function installWeeklyBriefingTrigger() {
-  if (Session.getScriptTimeZone() !== SB.timezone) {
-    throw new Error('Set the Apps Script project timezone to America/Detroit first.');
-  }
+  CONFIG_CACHE_ = null;
+  const cfg = cfg_();
+  assertTimezone_(cfg);
+  const hour = Math.min(23, Math.max(0, Number(cfg.briefingHour) || 9));
   ScriptApp.getProjectTriggers()
     .filter(t => t.getHandlerFunction() === 'sendWeeklyBriefing')
     .forEach(t => ScriptApp.deleteTrigger(t));
   ScriptApp.newTrigger('sendWeeklyBriefing')
-    .timeBased().onWeekDay(ScriptApp.WeekDay.SUNDAY).atHour(9).create();
-  SpreadsheetApp.getActive().toast('Sunday briefing enabled, around 9 AM Detroit time.');
+    .timeBased().onWeekDay(ScriptApp.WeekDay.SUNDAY).atHour(hour).create();
+  SpreadsheetApp.getActive().toast(
+    'Sunday briefing enabled, around ' + hour + ':00 ' + cfg.timezone + '.');
+}
+
+const REVIEW_HEADERS = [
+  'Status', 'Child', 'Type', 'Assignment / Event', 'Due Date (YYYY-MM-DD)',
+  'Due Time (if given)', 'Instructions', 'Teacher Email', 'Email Subject',
+  'Original Email', 'Message ID', 'Calendar Event ID', 'Confidence',
+  'Evidence from Email', 'Candidate ID', 'Created At', 'Error'
+];
+
+const BRIEFING_HEADERS = [
+  'Child', 'Category', 'Headline', 'Details', 'Parent Action',
+  'Relevant Date (YYYY-MM-DD)', 'Teacher Email', 'Email Subject',
+  'Original Email', 'Message ID', 'Received At', 'Confidence',
+  'Evidence from Email', 'Note ID', 'Action Status (Open/Done)'
+];
+
+function cfg_() {
+  if (!CONFIG_CACHE_) CONFIG_CACHE_ = loadFamilyConfig_();
+  return CONFIG_CACHE_;
+}
+
+function assertTimezone_(cfg) {
+  if (Session.getScriptTimeZone() !== cfg.timezone) {
+    throw new Error('Set the Apps Script project timezone to ' + cfg.timezone +
+      ' (same as Config timezone).');
+  }
+}
+
+function parseCsvList_(raw) {
+  return String(raw || '').split(',').map(function (part) {
+    return part.trim();
+  }).filter(Boolean);
+}
+
+function isTruthyConfig_(value) {
+  return /^(true|yes|1|on)$/i.test(String(value || '').trim());
+}
+
+function ensureConfigSheet_(book) {
+  let sheet = book.getSheetByName(SB.configSheet);
+  if (!sheet) {
+    sheet = book.insertSheet(SB.configSheet);
+    sheet.appendRow(CONFIG_HEADERS);
+    sheet.getRange(1, 1, 1, CONFIG_HEADERS.length)
+      .setFontWeight('bold').setBackground('#dbeafe');
+    sheet.setFrozenRows(1);
+    CONFIG_DEFAULTS.forEach(function (row) { sheet.appendRow(row); });
+    sheet.setColumnWidth(1, 200);
+    sheet.setColumnWidth(2, 280);
+    sheet.setColumnWidth(3, 360);
+    return sheet;
+  }
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(CONFIG_HEADERS);
+    CONFIG_DEFAULTS.forEach(function (row) { sheet.appendRow(row); });
+  }
+  const existing = {};
+  if (sheet.getLastRow() > 1) {
+    sheet.getRange(2, 1, sheet.getLastRow() - 1, 1).getValues().forEach(function (row) {
+      existing[String(row[0]).trim()] = true;
+    });
+  }
+  CONFIG_DEFAULTS.forEach(function (row) {
+    if (!existing[row[0]]) sheet.appendRow(row);
+  });
+  return sheet;
+}
+
+function ensureTeachersSheet_(book) {
+  const sheet = book.getSheetByName(SB.teachersSheet) || book.insertSheet(SB.teachersSheet);
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(TEACHER_HEADERS);
+    sheet.getRange(1, 1, 1, TEACHER_HEADERS.length)
+      .setFontWeight('bold').setBackground('#dbeafe');
+    sheet.setFrozenRows(1);
+    sheet.appendRow(['teacher@yourschool.org', 'Alex', '4th grade']);
+  } else if (sheet.getRange(1, 1, 1, TEACHER_HEADERS.length).getValues()[0]
+    .some(function (cell, i) { return cell !== TEACHER_HEADERS[i]; })) {
+    throw new Error('Sheet "Teachers" has unexpected column headers. No data modified.');
+  }
+  return sheet;
+}
+
+function loadFamilyConfig_() {
+  const book = SpreadsheetApp.getActiveSpreadsheet();
+  ensureConfigSheet_(book);
+  ensureTeachersSheet_(book);
+  const sheet = book.getSheetByName(SB.configSheet);
+  const map = {};
+  if (sheet.getLastRow() > 1) {
+    sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getValues().forEach(function (row) {
+      const key = String(row[0] || '').trim();
+      if (key) map[key] = String(row[1] == null ? '' : row[1]).trim();
+    });
+  }
+  CONFIG_DEFAULTS.forEach(function (row) {
+    if (map[row[0]] == null || map[row[0]] === '') {
+      if (!(row[0] in map)) map[row[0]] = row[1];
+    }
+  });
+  const props = PropertiesService.getScriptProperties();
+  const children = parseCsvList_(map.children);
+  const teachers = {};
+  const teacherSheet = book.getSheetByName(SB.teachersSheet);
+  if (teacherSheet && teacherSheet.getLastRow() > 1) {
+    teacherSheet.getRange(2, 1, teacherSheet.getLastRow() - 1, 3).getValues()
+      .forEach(function (row) {
+        const email = String(row[0] || '').trim().toLowerCase();
+        const child = String(row[1] || '').trim();
+        if (!email || email.indexOf('@') === -1 || !child) return;
+        if (/yourschool\.org/i.test(email)) return;
+        teachers[email] = {child: child, grade: String(row[2] || '').trim() || 'grade'};
+      });
+  }
+  const calendarId = (props.getProperty('FAMILY_CALENDAR_ID') || map.family_calendar_id || '').trim();
+  const notifyRaw = props.getProperty('NOTIFY_EMAILS');
+  const notifyEmails = parseCsvList_(notifyRaw == null ? map.notify_emails : notifyRaw);
+  return {
+    timezone: map.timezone || 'America/Detroit',
+    gmailLabel: map.gmail_label || 'School',
+    schoolDomain: String(map.school_domain || '').toLowerCase().replace(/^@/, ''),
+    schoolName: map.school_name || 'Your School',
+    schoolShortName: map.school_short_name || 'School',
+    schoolInitials: (map.school_initials || 'YS').slice(0, 3).toUpperCase(),
+    familyName: map.family_name || 'Your family',
+    children: children,
+    teachers: teachers,
+    calendarId: calendarId,
+    notifyEmails: notifyEmails,
+    briefingHour: map.briefing_hour || '9',
+    vocabPackets: isTruthyConfig_(map.advanced_vocab_packets),
+    mathMasters: isTruthyConfig_(map.advanced_math_masters),
+    vocabChildren: parseCsvList_(map.vocab_children),
+    mathChildren: parseCsvList_(map.math_masters_children)
+  };
+}
+
+function packetChildrenAllowed_(configured, allChildren, child) {
+  const name = String(child || '').trim();
+  if (!name) return false;
+  const allow = configured.length ? configured : allChildren;
+  return allow.some(function (item) {
+    return item.toLowerCase() === name.toLowerCase();
+  });
 }
 
 function runSchoolBot() {
@@ -162,7 +313,7 @@ function scanSchoolEmails() {
     const knownNotes = briefing.getLastRow() > 1
       ? new Set(briefing.getRange(2, 14, briefing.getLastRow() - 1, 1)
           .getValues().map(r => String(r[0]))) : new Set();
-    const query = 'label:' + SB.gmailLabel + ' newer_than:90d';
+    const query = 'label:' + cfg_().gmailLabel + ' newer_than:90d';
     let examined = 0;
     let added = 0;
 
@@ -178,7 +329,7 @@ function scanSchoolEmails() {
           if (!isSchoolSender_(sender) ||
               (processedIds.has(messageId) && briefingProcessedIds.has(messageId))) continue;
           examined++;
-          const teacher = TEACHERS[sender] || null;
+          const teacher = cfg_().teachers[sender] || null;
           const emailLink = thread.getPermalink();
           let extraction;
           try {
@@ -198,7 +349,7 @@ function scanSchoolEmails() {
             const dueDate = /^\d{4}-\d{2}-\d{2}$/.test(item.dueDate || '')
               ? item.dueDate : '';
             const match = findSimilar_(known, child, title, dueDate, item.evidence);
-            const today = Utilities.formatDate(new Date(), SB.timezone, 'yyyy-MM-dd');
+            const today = Utilities.formatDate(new Date(), cfg_().timezone, 'yyyy-MM-dd');
             const status = !dueDate ? 'Needs date'
               : dueDate < today ? 'Skipped'
               : match === 'duplicate' ? 'Possible duplicate'
@@ -260,9 +411,7 @@ function publishApprovedRows() {
   if (!lock.tryLock(1000)) return;
   try {
     const config = configuration_();
-    if (Session.getScriptTimeZone() !== SB.timezone) {
-      throw new Error('Set the Apps Script project timezone to America/Detroit first.');
-    }
+    assertTimezone_(config.family);
     const calendar = CalendarApp.getCalendarById(config.calendarId);
     if (!calendar) throw new Error('Family calendar not accessible. Check its ID and edit permission.');
     const sheet = requireSheet_(SpreadsheetApp.getActiveSpreadsheet(), SB.reviewSheet);
@@ -280,7 +429,7 @@ function publishApprovedRows() {
         if (!dueDate || !title) throw new Error('Enter a valid due date and assignment title.');
 
         const teacherEmail = String(row[7] || '').trim().toLowerCase();
-        const teacher = TEACHERS[teacherEmail] || null;
+        const teacher = cfg_().teachers[teacherEmail] || null;
         const child = String(row[1] || (teacher ? teacher.child : 'School')).trim();
         const kind = String(row[2] || 'Assignment').trim();
         const eventTitle = '[' + child + '] ' + kind + ': ' + title;
@@ -309,7 +458,7 @@ function publishApprovedRows() {
         sheet.getRange(rowNumber, 17).clearContent();
         published++;
         notices.push(
-          eventTitle + ' — ' + Utilities.formatDate(dueDate, SB.timezone, 'EEE MMM d')
+          eventTitle + ' — ' + Utilities.formatDate(dueDate, cfg_().timezone, 'EEE MMM d')
         );
         Utilities.sleep(1200);
       } catch (error) {
@@ -326,9 +475,7 @@ function publishApprovedRows() {
 }
 
 function notifyParents_(lines) {
-  const raw = PropertiesService.getScriptProperties().getProperty('NOTIFY_EMAILS');
-  const list = (raw == null ? DEFAULT_NOTIFY : raw)
-    .split(',').map(function (address) { return address.trim(); }).filter(Boolean);
+  const list = cfg_().notifyEmails.slice();
   if (!list.length) return;
   const book = SpreadsheetApp.getActive();
   const url = book ? book.getUrl() : '';
@@ -360,11 +507,16 @@ function previewWeeklyBriefing() {
   sheet.getRange(3, 1, cells.length, 1).setWrap(true);
 
   let nextRow = 3 + cells.length;
-  if (digest.vocabLists.length) {
-    sheet.getRange(nextRow, 1).setValue('On send, a PDF packet is attached for ' +
-      digest.vocabLists.map(function (list) {
-        return list.child + ' (' + list.words.length + ' words)';
-      }).join('; ') + '.');
+  const packetNotes = [];
+  (digest.vocabLists || []).forEach(function (list) {
+    packetNotes.push(list.child + ' vocab (' + list.words.length + ' words)');
+  });
+  (digest.mathLists || []).forEach(function (list) {
+    packetNotes.push(list.child + ' Math Masters (×' + list.sets.join('/') + ')');
+  });
+  if (packetNotes.length) {
+    sheet.getRange(nextRow, 1).setValue(
+      'On send, PDF packet(s) attached: ' + packetNotes.join('; ') + '.');
   }
   sheet.setColumnWidth(1, 420);
   sheet.setColumnWidth(2, 420);
@@ -393,13 +545,13 @@ function sendWeeklyBriefing_(force) {
       SpreadsheetApp.getActive().toast('Briefing already sent for this week.');
       return;
     }
-    const attachments = buildVocabAttachments_(digest);
+    const attachments = buildBriefingAttachments_(digest);
     const options = {htmlBody: digest.html, name: 'School Email Bot'};
     if (attachments.length) options.attachments = attachments;
     GmailApp.sendEmail(recipients.join(','), digest.subject, digest.plain, options);
     props.setProperty('LAST_BRIEFING_WEEK', digest.weekKey);
     console.log('Weekly briefing sent for ' + digest.weekKey +
-      (attachments.length ? ' with ' + attachments.length + ' vocab packet(s).' : '.'));
+      (attachments.length ? ' with ' + attachments.length + ' packet(s).' : '.'));
     SpreadsheetApp.getActive().toast('Weekly briefing sent.');
   } finally {
     lock.releaseLock();
@@ -407,17 +559,16 @@ function sendWeeklyBriefing_(force) {
 }
 
 function briefingRecipients_() {
-  const raw = PropertiesService.getScriptProperties().getProperty('NOTIFY_EMAILS');
-  const list = (raw == null ? DEFAULT_NOTIFY : raw)
-    .split(',').map(function (address) { return address.trim(); }).filter(Boolean);
-  if (!list.length) throw new Error('Set NOTIFY_EMAILS to at least one parent address.');
+  const list = cfg_().notifyEmails.slice();
+  if (!list.length) {
+    throw new Error('Set notify_emails on the Config sheet (or NOTIFY_EMAILS in Script Properties).');
+  }
   return list;
 }
 
 function buildWeeklyBriefing_(anchorDate) {
-  if (Session.getScriptTimeZone() !== SB.timezone) {
-    throw new Error('Set Apps Script timezone to America/Detroit first.');
-  }
+  const family = cfg_();
+  assertTimezone_(family);
   const book = SpreadsheetApp.getActiveSpreadsheet();
   const review = requireSheet_(book, SB.reviewSheet);
   const notesSheet = requireSheet_(book, SB.briefingSheet);
@@ -497,9 +648,15 @@ function buildWeeklyBriefing_(anchorDate) {
   const uniquePending = dedupeBriefing_(pending);
   const actions = notes.filter(n => isRealAction_(n.action));
   const announcements = notes.filter(n => !isRealAction_(n.action));
-  const vocabLists = vocabListsForWeek_(readReviewRows_(review), weekStart, weekEnd);
-  const dateLabel = Utilities.formatDate(window.start, SB.timezone, 'MMM d') + '–' +
-    Utilities.formatDate(window.end, SB.timezone, 'MMM d, yyyy');
+  const reviewRows = readReviewRows_(review);
+  const vocabLists = family.vocabPackets
+    ? vocabListsForWeek_(reviewRows, weekStart, weekEnd, family)
+    : [];
+  const mathLists = family.mathMasters
+    ? mathMastersListsForWeek_(reviewRows, weekStart, weekEnd, family)
+    : [];
+  const dateLabel = Utilities.formatDate(window.start, family.timezone, 'MMM d') + '–' +
+    Utilities.formatDate(window.end, family.timezone, 'MMM d, yyyy');
   const subject = 'Family School Briefing | ' + dateLabel;
   const rendered = renderBriefing_({
     dateLabel: dateLabel,
@@ -510,11 +667,19 @@ function buildWeeklyBriefing_(anchorDate) {
     announcements: announcements,
     pending: uniquePending,
     vocabLists: vocabLists,
-    sheetUrl: book.getUrl()
+    mathLists: mathLists,
+    sheetUrl: book.getUrl(),
+    brand: {
+      schoolName: family.schoolName,
+      schoolShortName: family.schoolShortName,
+      schoolInitials: family.schoolInitials,
+      familyName: family.familyName,
+      childrenLabel: family.children.join(', ')
+    }
   });
   return {
     subject: subject, plain: rendered.plain, html: rendered.html,
-    weekKey: weekStart, vocabLists: vocabLists
+    weekKey: weekStart, vocabLists: vocabLists, mathLists: mathLists
   };
 }
 
@@ -555,12 +720,16 @@ function dedupeBriefing_(items) {
 function prettyDate_(yyyyMmDd) {
   const date = parseLocalDate_(yyyyMmDd);
   if (!date) return '';
-  return Utilities.formatDate(date, SB.timezone, 'EEE, MMM d');
+  return Utilities.formatDate(date, cfg_().timezone, 'EEE, MMM d');
 }
 
 function renderBriefing_(model) {
   // pending is triage-only (Needs date / Possible duplicate / Possible update).
   const exceptions = model.pending.slice();
+  const brand = model.brand || {
+    schoolName: 'Your School', schoolShortName: 'School', schoolInitials: 'YS',
+    familyName: 'Your family', childrenLabel: 'your kids'
+  };
   const summary = buildBriefingSummary_(model, exceptions);
   const reminder = pickBriefingReminder_(exceptions, model.actions);
   const updates = buildBriefingUpdates_(model.actions, model.announcements, reminder);
@@ -588,12 +757,14 @@ function renderBriefing_(model) {
     '<table role="presentation" width="38" height="38" cellspacing="0" cellpadding="0" border="0" ' +
     'style="width:38px;height:38px;border:1px solid #9eb5a4;border-collapse:separate;border-radius:50%">' +
     '<tbody><tr><td align="center" valign="middle" style="color:#f5f3e9;' +
-    "font-family:Georgia,'Times New Roman',serif;font-size:14px;line-height:18px;letter-spacing:1px\">LS</td>" +
+    "font-family:Georgia,'Times New Roman',serif;font-size:14px;line-height:18px;letter-spacing:1px\">" +
+    escapeHtml_(brand.schoolInitials) + '</td>' +
     '</tr></tbody></table></td>' +
     '<td valign="middle" style="padding-left:10px">' +
-    '<div style="color:#f7f5eb;font-size:14px;line-height:19px;font-weight:600">Living Stones Academy</div>' +
+    '<div style="color:#f7f5eb;font-size:14px;line-height:19px;font-weight:600">' +
+    escapeHtml_(brand.schoolName) + '</div>' +
     '<div style="color:#cad8cc;font-size:10px;line-height:15px;letter-spacing:1.2px;' +
-    'text-transform:uppercase">Dawkins family</div></td>' +
+    'text-transform:uppercase">' + escapeHtml_(brand.familyName) + '</div></td>' +
     '<td align="right" valign="middle" style="color:#dce5dc;font-size:9px;line-height:14px;' +
     'letter-spacing:1px;text-transform:uppercase">Family weekly note</td>' +
     '</tr></tbody></table></td></tr>');
@@ -603,16 +774,18 @@ function renderBriefing_(model) {
     '<div style="color:#b87937;font-size:10px;line-height:14px;font-weight:700;' +
     'letter-spacing:1.4px;text-transform:uppercase">A clear note for the week</div>' +
     '<h1 style="margin:9px 0 7px;color:#26352d;font-family:Georgia,\'Times New Roman\',serif;' +
-    'font-size:28px;line-height:35px;font-weight:400">Hello, Dawkins family.</h1>' +
+    'font-size:28px;line-height:35px;font-weight:400">Hello, ' +
+    escapeHtml_(brand.familyName) + '.</h1>' +
     '<p style="margin:0;color:#65756c;font-size:13px;line-height:20px">' +
-    'Here\'s what matters for Mitch, Malik, and Micah this week.</p>' +
+    'Here\'s what matters for ' + escapeHtml_(brand.childrenLabel || 'your kids') +
+    ' this week.</p>' +
     '<table role="presentation" cellspacing="0" cellpadding="0" border="0" style="margin-top:17px;' +
     'border-collapse:collapse"><tbody><tr>' +
     '<td style="padding:7px 10px;background-color:#edf3ed;color:#355747;font-size:10px;' +
     'line-height:14px;font-weight:700;letter-spacing:.25px">WEEK OF ' +
     escapeHtml_(String(model.dateLabel || '').toUpperCase()) + '</td>' +
     '<td style="padding-left:11px;color:#65756c;font-size:10px;line-height:14px">' +
-    'Living Stones Academy</td></tr></tbody></table></td></tr>');
+    escapeHtml_(brand.schoolName) + '</td></tr></tbody></table></td></tr>');
 
   // Short version
   html.push('<tr><td style="padding:0 32px 22px">' +
@@ -663,7 +836,7 @@ function renderBriefing_(model) {
   // Around school updates
   html.push('<tr><td style="padding:0 32px 10px"><h2 style="margin:0;color:#26352d;' +
     "font-family:Georgia,'Times New Roman',serif;font-size:20px;line-height:26px;font-weight:400\">" +
-    'Around Living Stones</h2></td></tr>');
+    'Around ' + escapeHtml_(brand.schoolShortName) + '</h2></td></tr>');
   if (!updates.length) {
     html.push('<tr><td style="padding:12px 32px 24px;color:#65756c;font-size:11px;line-height:17px">' +
       'Nothing else needs attention beyond the calendar this week.</td></tr>');
@@ -738,21 +911,32 @@ function renderBriefing_(model) {
   }
   html.push('</td></tr>');
 
-  // Vocab
-  if (model.vocabLists.length) {
-    html.push('<tr><td style="padding:18px 32px 22px;border-top:1px solid #e7e9e1;background-color:#fffefa">' +
-      '<h2 style="margin:0 0 10px;color:#26352d;font-family:Georgia,\'Times New Roman\',serif;' +
-      'font-size:18px;line-height:24px;font-weight:400">Spelling and vocabulary</h2>');
-    model.vocabLists.forEach(function (list) {
-      html.push('<p style="margin:0 0 8px;color:#26352d;font-size:12px;line-height:18px"><strong>' +
-        escapeHtml_(list.child) + '</strong> — ' + escapeHtml_(list.words.join(', ')) + '</p>');
-      if (list.notes.length) {
-        html.push('<p style="margin:0 0 8px;color:#65756c;font-size:11px;line-height:16px">' +
-          escapeHtml_(list.notes.join(' ')) + '</p>');
-      }
-    });
+  // Advanced packets
+  if ((model.vocabLists && model.vocabLists.length) || (model.mathLists && model.mathLists.length)) {
+    html.push('<tr><td style="padding:18px 32px 22px;border-top:1px solid #e7e9e1;background-color:#fffefa">');
+    if (model.vocabLists && model.vocabLists.length) {
+      html.push('<h2 style="margin:0 0 10px;color:#26352d;font-family:Georgia,\'Times New Roman\',serif;' +
+        'font-size:18px;line-height:24px;font-weight:400">Spelling and vocabulary</h2>');
+      model.vocabLists.forEach(function (list) {
+        html.push('<p style="margin:0 0 8px;color:#26352d;font-size:12px;line-height:18px"><strong>' +
+          escapeHtml_(list.child) + '</strong> — ' + escapeHtml_(list.words.join(', ')) + '</p>');
+        if (list.notes.length) {
+          html.push('<p style="margin:0 0 8px;color:#65756c;font-size:11px;line-height:16px">' +
+            escapeHtml_(list.notes.join(' ')) + '</p>');
+        }
+      });
+    }
+    if (model.mathLists && model.mathLists.length) {
+      html.push('<h2 style="margin:16px 0 10px;color:#26352d;font-family:Georgia,\'Times New Roman\',serif;' +
+        'font-size:18px;line-height:24px;font-weight:400">Math Masters</h2>');
+      model.mathLists.forEach(function (list) {
+        html.push('<p style="margin:0 0 8px;color:#26352d;font-size:12px;line-height:18px"><strong>' +
+          escapeHtml_(list.child) + '</strong> — multiples of ' +
+          escapeHtml_(list.sets.join(', ')) + '</p>');
+      });
+    }
     html.push('<p style="margin:0;color:#65756c;font-size:10px;line-height:15px">' +
-      'A printable packet is attached when this briefing is sent.</p></td></tr>');
+      'Printable packet(s) are attached when this briefing is sent.</p></td></tr>');
   }
 
   // Sources / review sheet
@@ -787,8 +971,9 @@ function renderBriefing_(model) {
 
   html.push('</tbody></table>');
   html.push('<p style="max-width:560px;margin:12px auto 0;color:#7a877d;font-size:9px;' +
-    'line-height:14px;text-align:center">A weekly summary for the Dawkins family · Prepared from ' +
-    'Living Stones Academy messages</p>');
+    'line-height:14px;text-align:center">A weekly summary for ' +
+    escapeHtml_(brand.familyName) + ' · Prepared from ' +
+    escapeHtml_(brand.schoolName) + ' messages</p>');
   html.push('</td></tr></tbody></table></div>');
   return {plain: plain, html: html.join('')};
 }
@@ -913,7 +1098,8 @@ function buildBriefingPlain_(model, exceptions, summary, reminder, updates) {
     if (reminder.action) plain.push(reminder.action);
     if (reminder.link) plain.push('Open email: ' + reminder.link);
   }
-  plain.push('\nAROUND LIVING STONES');
+  const brand = model.brand || {schoolShortName: 'School', familyName: 'Your family', schoolName: 'Your School'};
+  plain.push('\nAROUND ' + String(brand.schoolShortName || 'SCHOOL').toUpperCase());
   if (!updates.length) {
     plain.push('Nothing else needs attention beyond the calendar this week.');
   } else {
@@ -942,10 +1128,16 @@ function buildBriefingPlain_(model, exceptions, summary, reminder, updates) {
       if (item.link) plain.push('Open email: ' + item.link);
     });
   }
-  if (model.vocabLists.length) {
+  if (model.vocabLists && model.vocabLists.length) {
     plain.push('\nSPELLING AND VOCABULARY');
     model.vocabLists.forEach(function (list) {
       plain.push(list.child + ' — ' + list.words.join(', '));
+    });
+  }
+  if (model.mathLists && model.mathLists.length) {
+    plain.push('\nMATH MASTERS');
+    model.mathLists.forEach(function (list) {
+      plain.push(list.child + ' — multiples of ' + list.sets.join(', '));
     });
   }
   if (model.sheetUrl) plain.push('\nReview sheet: ' + model.sheetUrl);
@@ -956,13 +1148,13 @@ function buildBriefingPlain_(model, exceptions, summary, reminder, updates) {
 function shortMonthDay_(yyyyMmDd) {
   const date = parseLocalDate_(yyyyMmDd);
   if (!date) return '';
-  return Utilities.formatDate(date, SB.timezone, 'MMM d').toUpperCase();
+  return Utilities.formatDate(date, cfg_().timezone, 'MMM d').toUpperCase();
 }
 
 function shortDayLabel_(yyyyMmDd) {
   const date = parseLocalDate_(yyyyMmDd);
   if (!date) return '';
-  return Utilities.formatDate(date, SB.timezone, 'EEE').toUpperCase();
+  return Utilities.formatDate(date, cfg_().timezone, 'EEE').toUpperCase();
 }
 
 /** Sunday covers the coming Monday–Sunday. Weekdays cover the current school week. */
@@ -976,7 +1168,7 @@ function schoolWeek_(anchorDate) {
 }
 
 function localDateKey_(date) {
-  return Utilities.formatDate(date, SB.timezone, 'yyyy-MM-dd');
+  return Utilities.formatDate(date, cfg_().timezone, 'yyyy-MM-dd');
 }
 
 function escapeHtml_(value) {
@@ -1002,16 +1194,17 @@ function openEmailHtml_(url) {
 }
 
 /**
- * Mitch is the 9-year-old this packet prompt is written for.
+ * Advanced: vocabulary/spelling packet candidates for the week.
  * A list counts when a Review row due this week names vocabulary or
  * spelling and the instructions include the teacher's word list.
  */
-function vocabListsForWeek_(rows, weekStart, weekEnd) {
+function vocabListsForWeek_(rows, weekStart, weekEnd, family) {
   const groups = new Map();
   rows.forEach(function (row) {
     const status = String(row[0] || '').trim();
     if (status === 'Skipped' || status === 'Possible duplicate' || status === 'Error') return;
-    if (String(row[1] || '').trim() !== 'Mitch') return;
+    const child = String(row[1] || '').trim();
+    if (!packetChildrenAllowed_(family.vocabChildren, family.children, child)) return;
     const due = parseLocalDate_(row[4]);
     const dueKey = due ? localDateKey_(due) : '';
     if (!dueKey || dueKey < weekStart || dueKey > weekEnd) return;
@@ -1019,10 +1212,12 @@ function vocabListsForWeek_(rows, weekStart, weekEnd) {
     if (!/vocab|spelling/i.test(blob)) return;
     const parsed = parseWordList_(String(row[6] || '') + '\n' + String(row[13] || ''));
     if (parsed.words.length < 3) return;
-    const key = parsed.words.map(function (word) { return word.toLowerCase(); }).sort().join('|');
+    const key = child + '|' + parsed.words.map(function (word) {
+      return word.toLowerCase();
+    }).sort().join('|');
     if (groups.has(key)) return;
     groups.set(key, {
-      child: 'Mitch',
+      child: child,
       words: parsed.words,
       notes: parsed.notes,
       title: String(row[3] || 'Vocabulary'),
@@ -1030,6 +1225,57 @@ function vocabListsForWeek_(rows, weekStart, weekEnd) {
     });
   });
   return Array.from(groups.values());
+}
+
+/**
+ * Advanced: Math Masters / multiplication-fact practice from teacher emails.
+ * Parses "multiples of 2, 5, 10" style lines from instructions.
+ */
+function mathMastersListsForWeek_(rows, weekStart, weekEnd, family) {
+  const groups = new Map();
+  rows.forEach(function (row) {
+    const status = String(row[0] || '').trim();
+    if (status === 'Skipped' || status === 'Possible duplicate' || status === 'Error') return;
+    const child = String(row[1] || '').trim();
+    if (!packetChildrenAllowed_(family.mathChildren, family.children, child)) return;
+    const due = parseLocalDate_(row[4]);
+    const dueKey = due ? localDateKey_(due) : '';
+    if (!dueKey || dueKey < weekStart || dueKey > weekEnd) return;
+    const blob = [row[2], row[3], row[6], row[13]].join(' ');
+    if (!/math masters|math facts|multiplication|multiples of/i.test(blob)) return;
+    const sets = parseMathMasterSets_(String(row[6] || '') + '\n' + String(row[13] || ''));
+    if (!sets.length) return;
+    const key = child + '|' + sets.join('|');
+    if (groups.has(key)) return;
+    groups.set(key, {
+      child: child,
+      sets: sets,
+      title: String(row[3] || 'Math Masters'),
+      due: dueKey
+    });
+  });
+  return Array.from(groups.values());
+}
+
+function parseMathMasterSets_(text) {
+  const source = String(text || '');
+  const found = [];
+  const seen = {};
+  const re = /multiples?\s+of\s+([0-9,\sand]+)/gi;
+  let match;
+  while ((match = re.exec(source))) {
+    String(match[1]).split(/,|\band\b/i).forEach(function (part) {
+      const n = Number(String(part).replace(/[^0-9]/g, ''));
+      if (!n || n < 1 || n > 12 || seen[n]) return;
+      seen[n] = true;
+      found.push(n);
+    });
+  }
+  if (found.length) return found.sort(function (a, b) { return a - b; });
+  if (/math masters|math facts|multiplication/i.test(source)) {
+    return [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+  }
+  return [];
 }
 
 function parseWordList_(text) {
@@ -1061,11 +1307,10 @@ function parseWordList_(text) {
   return {words: words, notes: notes};
 }
 
-function buildVocabAttachments_(digest) {
-  if (!digest.vocabLists.length) return [];
+function buildBriefingAttachments_(digest) {
   const notes = [];
   const attachments = [];
-  digest.vocabLists.forEach(function (list) {
+  (digest.vocabLists || []).forEach(function (list) {
     try {
       const packet = generateVocabPacket_(list, digest.weekKey);
       attachments.push(packet.blob);
@@ -1073,11 +1318,89 @@ function buildVocabAttachments_(digest) {
         packet.blob.getName() + '). The answer key is the last page.');
     } catch (error) {
       console.error('Vocab packet failed: ' + String(error.message || error));
-      notes.push(list.child + ': packet was not attached. ' + String(error.message || error));
+      notes.push(list.child + ': vocab packet was not attached. ' + String(error.message || error));
+    }
+  });
+  (digest.mathLists || []).forEach(function (list) {
+    try {
+      const packet = generateMathMastersPacket_(list, digest.weekKey);
+      attachments.push(packet.blob);
+      notes.push(list.child + ': Math Masters packet attached (' +
+        packet.blob.getName() + '). The answer key is the last page.');
+    } catch (error) {
+      console.error('Math Masters packet failed: ' + String(error.message || error));
+      notes.push(list.child + ': Math Masters packet was not attached. ' +
+        String(error.message || error));
     }
   });
   appendBriefingLines_(digest, notes);
   return attachments;
+}
+
+function generateMathMastersPacket_(list, weekKey) {
+  const sets = (list.sets || []).slice();
+  if (!sets.length) throw new Error('Need at least one multiplication set.');
+  const seed = weekKey + '|math|' + list.child + '|' + sets.join('|');
+  const problems = buildMathMasterProblems_(sets, seed, 24);
+  const mixed = buildMathMasterProblems_(sets, seed + ':mixed', 16);
+  const html = buildMathMastersHtml_(list.child, sets, problems, mixed);
+  const slug = normalize_(list.title).replace(/\s+/g, '-').slice(0, 40) || 'math-masters';
+  const filename = list.child + '-' + slug + '-' + weekKey + '.pdf';
+  return {blob: htmlToPdfBlob_(html, filename)};
+}
+
+function buildMathMasterProblems_(sets, seed, count) {
+  const problems = [];
+  let i = 0;
+  while (problems.length < count) {
+    const table = sets[i % sets.length];
+    const other = 1 + (hashSeed_(seed + ':' + problems.length) % 12);
+    const a = (hashSeed_(seed + ':flip:' + problems.length) % 2) ? table : other;
+    const b = a === table ? other : table;
+    problems.push({a: a, b: b, answer: a * b});
+    i++;
+  }
+  return problems;
+}
+
+function buildMathMastersHtml_(child, sets, problems, mixed) {
+  const pages = [];
+  pages.push(packetPage_([
+    '<h1>Math Masters — Fact practice</h1>',
+    nameDateLine_(child),
+    '<p>This week\'s sets: multiples of ' + escapeHtml_(sets.join(', ')) + '.</p>',
+    '<h2>Warm-up</h2>',
+    '<p>Solve each fact. Work down the page.</p>',
+    tableHtml_([['Fact', 'Answer']].concat(problems.map(function (item) {
+      return [escapeHtml_(item.a + ' × ' + item.b), '________'];
+    })))
+  ].join('')));
+  pages.push(packetPage_([
+    '<h1>Math Masters — Mixed review</h1>',
+    nameDateLine_(child),
+    '<h2>Mixed facts</h2>',
+    tableHtml_([['Fact', 'Answer']].concat(mixed.map(function (item) {
+      return [escapeHtml_(item.a + ' × ' + item.b), '________'];
+    }))),
+    '<h2>Missed ones</h2>',
+    '<p>Write any facts you missed and solve them again.</p>',
+    '<p>________________________________</p>',
+    '<p>________________________________</p>',
+    '<p>________________________________</p>'
+  ].join('')));
+  pages.push(packetPage_([
+    '<h1>Answer key — Parent / caregiver</h1>',
+    '<p>Sets: multiples of ' + escapeHtml_(sets.join(', ')) + '</p>',
+    '<h2>Warm-up</h2>',
+    '<ol>' + problems.map(function (item) {
+      return '<li>' + escapeHtml_(item.a + ' × ' + item.b + ' = ' + item.answer) + '</li>';
+    }).join('') + '</ol>',
+    '<h2>Mixed review</h2>',
+    '<ol>' + mixed.map(function (item) {
+      return '<li>' + escapeHtml_(item.a + ' × ' + item.b + ' = ' + item.answer) + '</li>';
+    }).join('') + '</ol>'
+  ].join('')));
+  return '<!DOCTYPE html><html><body>' + pages.join('') + '</body></html>';
 }
 
 function appendBriefingLines_(digest, lines) {
@@ -1090,9 +1413,9 @@ function appendBriefingLines_(digest, lines) {
 }
 
 /**
- * Builds Mitch's Tue/Wed/Thu worksheet packet from a fixed template.
+ * Builds a Tue/Wed/Thu vocabulary worksheet packet from a fixed template.
  * Definitions come from a small kid-friendly map, then Free Dictionary API,
- * then a plain fallback. No LLM call.
+ * then a plain fallback. No LLM call. Advanced feature.
  */
 function generateVocabPacket_(list, weekKey) {
   const words = list.words.slice();
@@ -1791,19 +2114,28 @@ function linkifyGmail_(escapedText) {
 }
 
 function extractAssignments_(message, apiKey, teacher) {
-  const senderDate = Utilities.formatDate(message.getDate(), SB.timezone, 'yyyy-MM-dd EEEE');
-  const roster = [
-    'Mitch is in 4th grade. His teacher is davidw@livingstonesgr.org.',
-    'Malik is in Pre-K. His teacher is kathyw@livingstonesgr.org.',
-    'Micah is in Kindergarten. His teacher is ellam@livingstonesgr.org.'
-  ].join(' ');
+  const family = cfg_();
+  const senderDate = Utilities.formatDate(message.getDate(), family.timezone, 'yyyy-MM-dd EEEE');
+  const rosterParts = family.children.map(function (name) {
+    const pinned = Object.keys(family.teachers).filter(function (email) {
+      return family.teachers[email].child === name;
+    });
+    if (!pinned.length) return name + ' is a student in this family.';
+    return pinned.map(function (email) {
+      const info = family.teachers[email];
+      return name + ' is in ' + info.grade + '. Their teacher is ' + email + '.';
+    }).join(' ');
+  });
+  const roster = rosterParts.join(' ') || 'Children: ' + family.children.join(', ');
+  const childChoices = family.children.concat(['empty']).join(', ');
   const senderHint = teacher
     ? 'This sender is ' + teacher.child + "'s teacher (" + teacher.grade + '). Set child to ' + teacher.child + '.'
-    : 'This sender is other Livingstone staff. Set child only when the email clearly names Mitch, Malik, or Micah. Otherwise leave child empty.';
+    : 'This sender is other school staff. Set child only when the email clearly names ' +
+      family.children.join(', ') + '. Otherwise leave child empty.';
   const text = [
     'Sender: ' + message.getFrom(),
     'Subject: ' + message.getSubject(),
-    'Sent in America/Detroit: ' + senderDate,
+    'Sent in ' + family.timezone + ': ' + senderDate,
     'Email body:\n' + message.getPlainBody().slice(0, SB.maxBodyLength)
   ].join('\n');
   const parts = [{text: [
@@ -1813,13 +2145,13 @@ function extractAssignments_(message, apiKey, teacher) {
     senderHint,
     'Return one item for each distinct homework deadline, quiz, test, vocabulary',
     'test, spelling test, project, field trip, or important school date.',
-    'Use dueDate as YYYY-MM-DD in America/Detroit, or empty string if unknown.',
+    'Use dueDate as YYYY-MM-DD in ' + family.timezone + ', or empty string if unknown.',
     'Resolve unambiguous relative dates against the email sent date.',
-    'Never invent a date or an assignment. Child must be Mitch, Malik, Micah, or empty.',
+    'Never invent a date or an assignment. Child must be ' + childChoices + '.',
     'For a task without a stated deadline, include it with blank dueDate.',
     'Use type like Homework, Test, Quiz, Project, Vocabulary, or School Event.',
-    'Copy useful details such as page numbers, reading chapters, and spelling',
-    'or vocabulary word lists into the instructions field when provided.',
+    'Copy useful details such as page numbers, reading chapters, spelling or',
+    'vocabulary word lists, and Math Masters / multiplication sets into instructions.',
     'Use confidence from 0 to 1, and quote the evidence briefly.',
     'Ignore signatures, ads, old quoted replies, and generic encouragement.',
     'If there is no actionable school information, return items: [].',
@@ -1900,25 +2232,36 @@ function extractAssignments_(message, apiKey, teacher) {
 }
 
 function configuration_() {
-  const properties = PropertiesService.getScriptProperties();
-  const geminiKey = properties.getProperty('GEMINI_API_KEY');
-  const calendarId = (properties.getProperty('FAMILY_CALENDAR_ID') || FAMILY_CALENDAR_ID).trim();
-  if (!geminiKey) {
-    throw new Error('Set GEMINI_API_KEY in Script Properties.');
+  CONFIG_CACHE_ = null;
+  const cfg = cfg_();
+  const geminiKey = PropertiesService.getScriptProperties().getProperty('GEMINI_API_KEY');
+  if (!geminiKey) throw new Error('Set GEMINI_API_KEY in Script Properties.');
+  if (!cfg.schoolDomain || /yourschool\.org/i.test(cfg.schoolDomain)) {
+    throw new Error('Set school_domain on the Config sheet to your real school domain.');
   }
-  if (!calendarId) throw new Error('Family calendar id is missing.');
-  return {geminiKey, calendarId};
+  if (!cfg.calendarId) {
+    throw new Error('Set family_calendar_id on the Config sheet (or FAMILY_CALENDAR_ID in Script Properties).');
+  }
+  if (!cfg.children.length) {
+    throw new Error('Set children on the Config sheet (comma-separated names).');
+  }
+  return {geminiKey: geminiKey, calendarId: cfg.calendarId, family: cfg};
 }
 
 function isSchoolSender_(sender) {
-  return String(sender || '').toLowerCase().endsWith('@' + SB.schoolDomain);
+  const domain = cfg_().schoolDomain;
+  if (!domain) return false;
+  return String(sender || '').toLowerCase().endsWith('@' + domain);
 }
 
 function childForSender_(sender, extracted) {
-  const teacher = TEACHERS[String(sender || '').toLowerCase()];
+  const cfg = cfg_();
+  const teacher = cfg.teachers[String(sender || '').toLowerCase()];
   if (teacher) return teacher.child;
   const cleaned = cleanCell_(extracted, 100).replace(/^'/, '');
-  const known = CHILDREN.find(name => name.toLowerCase() === cleaned.toLowerCase());
+  const known = cfg.children.find(function (name) {
+    return name.toLowerCase() === cleaned.toLowerCase();
+  });
   return known || '';
 }
 
